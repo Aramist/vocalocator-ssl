@@ -232,20 +232,35 @@ class NoiseInjection(Augmentation):
 
 
 class AugmentationConfig:
-    should_use_augmentations: bool = True
-    mask_temporal_prob: float = 0.5
-    mask_temporal_min_length: int = 256
-    mask_temporal_max_length: int = 768
-    mask_temporal_use_noise: bool = True
-    mask_channels_prob: float = 0.5
-    mask_channels_min_channels: int = 1
-    mask_channels_max_channels: int = 2
-    mask_channels_use_noise: bool = True
-    noise_injection_prob: float = 0.5
-    noise_injection_snr_min: float = 3
-    noise_injection_snr_max: float = 12
+    should_use_augmentations: bool
+    mask_temporal_prob: float
+    mask_temporal_min_length: int
+    mask_temporal_max_length: int
+    mask_temporal_use_noise: bool
+    mask_channels_prob: float
+    mask_channels_min_channels: int
+    mask_channels_max_channels: int
+    mask_channels_use_noise: bool
+    noise_injection_prob: float
+    noise_injection_snr_min: float
+    noise_injection_snr_max: float
 
-    def __init__(self, **kwargs):
+    # list args explicitly to allow ide to provide auto-completion
+    def __init__(
+        self,
+        should_use_augmentations: bool = True,
+        mask_temporal_prob: float = 0.5,
+        mask_temporal_min_length: int = 256,
+        mask_temporal_max_length: int = 768,
+        mask_temporal_use_noise: bool = True,
+        mask_channels_prob: float = 0.5,
+        mask_channels_min_channels: int = 1,
+        mask_channels_max_channels: int = 2,
+        mask_channels_use_noise: bool = True,
+        noise_injection_prob: float = 0.5,
+        noise_injection_snr_min: float = 3,
+        noise_injection_snr_max: float = 12,
+    ):
         """Data class which wraps a dictionary of arguments while providing type hints.
 
         Args:
@@ -262,8 +277,18 @@ class AugmentationConfig:
             noise_injection_snr_min (float): Minimum SNR of the injected noise.
             noise_injection_snr_max (float): Maximum SNR of the injected noise
         """
-        for key, value in kwargs.items():
-            setattr(self, key, value)
+        self.should_use_augmentations = should_use_augmentations
+        self.mask_temporal_prob = mask_temporal_prob
+        self.mask_temporal_min_length = mask_temporal_min_length
+        self.mask_temporal_max_length = mask_temporal_max_length
+        self.mask_temporal_use_noise = mask_temporal_use_noise
+        self.mask_channels_prob = mask_channels_prob
+        self.mask_channels_min_channels = mask_channels_min_channels
+        self.mask_channels_max_channels = mask_channels_max_channels
+        self.mask_channels_use_noise = mask_channels_use_noise
+        self.noise_injection_prob = noise_injection_prob
+        self.noise_injection_snr_min = noise_injection_snr_min
+        self.noise_injection_snr_max = noise_injection_snr_max
 
 
 def build_augmentations(

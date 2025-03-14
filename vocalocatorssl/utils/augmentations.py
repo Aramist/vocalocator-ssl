@@ -12,6 +12,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from .profiling import record
+
 
 class Augmentation(nn.Module):
     def __init__(self, prob: float):
@@ -31,6 +33,7 @@ class Augmentation(nn.Module):
 
         self.prob = prob
 
+    @record
     def forward(self, audio: torch.Tensor) -> torch.Tensor:
         """Wraps the apply method with a dice roll. In eval mode, this is a no-op.
 
@@ -223,7 +226,11 @@ class NoiseInjection(Augmentation):
 
         # Sample an SNR for each batch member
         orig_std = torch.std(audio, dim=(1, 2), keepdim=True)
-        batch_snr = np.random.uniform(self.snr_min, self.snr_max, audio.shape[0])
+        batch_snr = (
+            torch.rand((len(audio),), device=audio.device)
+            * (self.snr_max - self.snr_min)
+            + self.snr_min
+        )[:, None, None]
         noise_mag = orig_std / 10 ** (batch_snr / 20)  # shape: (batch, 1, 1)
         noise_mag = noise_mag * batch_mask[:, None, None]
         audio = audio + torch.randn_like(audio) * noise_mag  # Does not mutate

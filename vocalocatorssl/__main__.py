@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import pyjson5 as json
 
-from .utils.trainer import eval, train
+from .utils.trainer import eval, training_loop
 
 
 def load_json(path: Path) -> dict:
@@ -29,11 +29,7 @@ if __name__ == "__main__":
     if args.save_path is not None:
         args.save_path.mkdir(parents=True, exist_ok=True)
 
-    index = None
-    if args.index is not None:
-        index = np.load(args.index)
-
     if args.eval:
-        eval(config, args.data, args.save_path, index)
+        eval(config, args.data, args.save_path, args.index)
     else:
-        train(config, args.data, args.save_path)
+        training_loop(config, args.data, args.save_path)

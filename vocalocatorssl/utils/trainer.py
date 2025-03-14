@@ -1,10 +1,8 @@
 import json
-import logging
-import os
-import sys
 import time
 from collections import deque
 from pathlib import Path
+from sys import stderr
 from typing import Optional
 
 import h5py
@@ -12,98 +10,91 @@ import numpy as np
 import torch
 from torch import optim
 from torch.nn import functional as F
-from torch.utils.data import DataLoader
 from tqdm import tqdm
-from vocalocator.training.augmentations import build_augmentations
-from vocalocator.training.configs import update_recursively
 
-from .dataloaders import VocalizationDataset, build_dataloaders
-from .model import Wavenet
-
-DEFAULT_CONFIG = {
-    "OPTIMIZATION": {
-        "NUM_WEIGHT_UPDATES": 500_000,
-        "WEIGHT_UPDATES_PER_EPOCH": 10_000,
-        "NUM_WARMUP_STEPS": 10_000,
-        "OPTIMIZER": "SGD",
-        "MOMENTUM": 0.7,
-        "WEIGHT_DECAY": 1e-05,
-        "CLIP_GRADIENTS": True,
-        "INITIAL_LEARNING_RATE": 0.003,
-    },
-    "ARCHITECTURE": "CorrSimpleNetwork",
-    "MODEL_PARAMS": {},
-    "DATA": {
-        "NUM_MICROPHONES": 24,
-        "CROP_LENGTH": 8192,
-        "ARENA_DIMS": [615, 615, 425],
-        "ARENA_DIMS_UNITS": "MM",
-        "SAMPLE_RATE": 250000,
-        "BATCH_SIZE": 32,
-        "NUM_FAKE_LOCATIONS": 4,
-        "MIN_DIFFICULTY": 300,
-        "MAX_DIFFICULTY": 30,
-    },
-    "AUGMENTATIONS": {
-        "AUGMENT_DATA": True,
-        "INVERSION": {"PROB": 0.5},
-        "NOISE": {"MIN_SNR": 3, "MAX_SNR": 15, "PROB": 0.5},
-        "MASK": {"PROB": 0.5, "MIN_LENGTH": 256, "MAX_LENGTH": 512},
-    },
-}
-
-logger = None
+from . import utils
+from .architectures import AudioEmbedder
+from .embeddings import LocationEmbedding
 
 
-def get_mem_usage():
-    if not torch.cuda.is_available():
-        return ""
-    used_gb = torch.cuda.max_memory_allocated() / (2**30)
-    total_gb = torch.cuda.get_device_properties(0).total_memory / (2**30)
-    torch.cuda.reset_peak_memory_stats()
-    return "Max mem. usage: {:.2f}/{:.2f}GiB".format(used_gb, total_gb)
+def append_loss(
+    training_loss_values: list[float],
+    validation_loss_values: list[float],
+    save_directory: Path,
+) -> None:
+    """Appends training and validation loss values to an hdf5 file in the save directory
+
+    Args:
+        training_loss_values (list[float]): Training loss values to append
+        validation_loss_values (list[float]): Validation loss values to append
+        save_directory (Path): Model save directory
+    """
+
+    loss_path = save_directory / "losses.h5"
+
+    with h5py.File(loss_path, "a") as f:
+        if training_loss_values:
+            if "training_loss" not in f:
+                f.create_dataset("training_loss", data=training_loss_values)
+            else:
+                old_losses = f["training_loss"][:]
+                del f["training_loss"]
+                f["training_loss"] = np.concatenate([old_losses, training_loss_values])
+        if validation_loss_values:
+            if "validation_loss" not in f:
+                f.create_dataset("validation_loss", data=validation_loss_values)
+            else:
+                old_losses = f["validation_loss"][:]
+                del f["validation_loss"]
+                f["validation_loss"] = np.concatenate(
+                    [old_losses, validation_loss_values]
+                )
 
 
-def train(
+def training_loop(
     config: dict,
     data_path: Path,
     save_directory: Optional[Path] = None,
 ):
-    global logger
-    if not save_directory:
-        print("No save directory specified, not saving model checkpoints.")
-        log_path = "train_log.log"
-    else:
-        log_path = save_directory / "train_log.log"
     if not torch.cuda.is_available():
         raise RuntimeError("Cuda not available!")
 
-    # Log to stdout and file
-    logger = logging.getLogger("train_logger")
-    logger.setLevel(logging.INFO)
-    formatter = logging.Formatter("%(asctime)s - %(message)s")
-    fh = logging.FileHandler(log_path)
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setLevel(logging.INFO)
-    sh.setFormatter(formatter)
-    logger.addHandler(sh)
+    # Get logger
+    if not save_directory:
+        print("No save directory specified, not saving model checkpoints.")
+        log_path = Path("train_log.log")
+    else:
+        log_path = save_directory / "train_log.log"
+    logger = utils.initialize_logger(log_path)
 
-    cfg = DEFAULT_CONFIG.copy()
-    config = update_recursively(config, cfg)
-    model: Wavenet = Wavenet(config)
-    model.cuda()
-    augmentor = build_augmentations(config)
+    default_cfg = utils.get_default_config()
+    config = utils.update_recursively(config, default_cfg)
 
-    train_dloader, val_dloader, test_dloader = build_dataloaders(
-        data_path, config, None
+    audio_embedder: AudioEmbedder = utils.initialize_audio_embedder(config)
+    audio_embedder.cuda()
+    location_embedder: LocationEmbedding = utils.initialize_location_embedding(config)
+    location_embedder.cuda()
+    scorer = utils.initialize_scorer(config)
+    scorer.cuda()
+
+    param_list = [
+        {"params": audio_embedder.parameters()},
+        {"params": location_embedder.parameters()},
+        {"params": scorer.parameters()},
+    ]
+    opt = utils.initialize_optimizer(config, param_list)
+
+    augmentor = utils.initialize_augmentations(config)
+    # loss_fn = utils.initialize_loss_function(config)
+    train_dloader, val_dloader, test_dloader = utils.initialize_dataloaders(
+        config, data_path, index_path=None
     )
+
+    print(f"Validation dataset size: {val_dloader.dataset.__len__()}")
 
     if save_directory is not None:
         with open(save_directory / "config.json", "w") as ctx:
-            json.dump(config, ctx)
+            json.dump(config, ctx, indent=4)
         index_dir = save_directory / "indices"
         index_dir.mkdir(exist_ok=True)
         np.save(save_directory / "train_idx.npy", train_dloader.dataset.index)
@@ -111,16 +102,9 @@ def train(
         if test_dloader is not None:
             np.save(save_directory / "test_idx.npy", test_dloader.dataset.index)
 
-    opt_config = config["OPTIMIZATION"]
-    total_num_updates = opt_config["NUM_WEIGHT_UPDATES"]
+    total_num_updates = config["optimization"]["num_weight_updates"]
 
-    opt = optim.SGD(
-        model.parameters(),
-        lr=opt_config["INITIAL_LEARNING_RATE"],
-        momentum=0.7,
-    )
-
-    n_warmup_steps = opt_config["NUM_WARMUP_STEPS"]
+    n_warmup_steps = config["optimization"]["num_warmup_steps"]
     warmup_sched = optim.lr_scheduler.LinearLR(opt, 0.05, 1.0, n_warmup_steps)
     cosine_sched = optim.lr_scheduler.CosineAnnealingLR(
         opt,
@@ -131,64 +115,82 @@ def train(
     sched = optim.lr_scheduler.SequentialLR(
         opt, [warmup_sched, cosine_sched], milestones=[n_warmup_steps]
     )
-    log_interval = 500
+    log_interval = 10
 
-    proc_times = deque(maxlen=30)
+    minibatch_proc_times = deque(maxlen=50)
 
     epoch = 0
-    mb_per_epoch = opt_config["WEIGHT_UPDATES_PER_EPOCH"]
+    mb_per_epoch = config["optimization"]["weight_updates_per_epoch"]
     n_mb_processed_cur_epoch = 0
     n_mb_procd = lambda: epoch * mb_per_epoch + n_mb_processed_cur_epoch
     while n_mb_procd() < total_num_updates:
-
         while n_mb_processed_cur_epoch < mb_per_epoch:
             # Training period
             for batch in train_dloader:
+                # Batch is a dictionary with keys 'audio' and 'labels'
+                # audio has shape (batch, time, channels)
+                # labels has shape (batch, 1 + num_negative, n_mice, n_nodes, n_dims)
                 if n_mb_processed_cur_epoch >= mb_per_epoch:
                     break
                 opt.zero_grad()
 
                 audio, labels = batch["audio"], batch["labels"]
-                rand_perm = torch.randperm(labels.shape[1])
                 audio = audio.cuda()
-                labels = labels[:, rand_perm, ...].cuda()
-                class_label = (
-                    rand_perm.numpy().argmin()
-                )  # location of the true label in the shuffled array
-
+                labels = labels.cuda()
                 aug_audio = augmentor(audio)
-                embedded_audio = model.embed_audio(aug_audio)
-                embedded_locations = model.embed_location(labels)
 
-                scores = model.score_pairs(embedded_audio, embedded_locations)
-                targets = torch.tensor([class_label] * audio.shape[0]).cuda()
-                loss = F.cross_entropy(scores, targets)
+                # embeded_audio: (batch, features)
+                embedded_audio: torch.Tensor = audio_embedder(aug_audio)
+                # embedded_locations: (batch, 1 + num_negative, features)
+                embedded_locations: torch.Tensor = location_embedder(labels)
 
-                loss.backward()
+                # Make audio embeddings broadcastable
+                embedded_audio = embedded_audio.unsqueeze(1).expand_as(
+                    embedded_locations
+                )
+                # scores: (batch, 1 + num_negative)
+                scores = scorer(embedded_audio, embedded_locations)
+                loss = F.cross_entropy(
+                    scores,
+                    torch.zeros(scores.shape[0], dtype=torch.long).cuda(),
+                    reduction="none",
+                )  # (batch,)
 
-                proc_times.append(time.time())
+                loss.mean().backward()
+                if config["optimization"]["clip_gradients"]:
+                    try:
+                        audio_embedder.clip_grads()
+                    except AttributeError:
+                        print(
+                            "Failed to clip audio embedder grads. Method not implemented",
+                            file=stderr,
+                        )
+                        config["optimization"]["clip_gradients"] = False
+
+                minibatch_proc_times.append(time.time())
 
                 opt.step()
                 sched.step()
-                train_dloader.dataset.step_difficulty()
+                # train_dloader.dataset.step_difficulty()
                 n_mb_processed_cur_epoch += 1
                 # Log progress
                 if (n_mb_procd() % log_interval) == 0:
-                    logger.info(get_mem_usage())
-                    processing_speed = len(proc_times) / (
-                        proc_times[-1] - proc_times[0]
+                    logger.info(utils.get_mem_usage())
+                    processing_speed = len(minibatch_proc_times) / (
+                        minibatch_proc_times[-1] - minibatch_proc_times[0]
                     )
                     logger.info(
                         f"Progress: {n_mb_procd()} / {total_num_updates} weight updates."
                     )
-                    logger.info(
-                        f"Current sampling difficulty: {train_dloader.dataset.difficulty:.2f} / 1.0"
-                    )
+                    # logger.info(
+                    #     f"Current sampling difficulty: {train_dloader.dataset.difficulty:.2f} / 1.0"
+                    # )
                     # Losses are in the order time, freq, kl, features, discriminator, adversarial
-                    loss = loss.detach().cpu().item()
+                    loss = loss.detach().mean().cpu().item()
+                    append_loss([loss], [], save_directory)
                     logger.info(f"Loss: {loss:.2f}")
                     logger.info(
-                        f"Speed: {processing_speed*audio.shape[0]:.1f} vocalizations per second"
+                        f"Speed: {processing_speed * audio.shape[0]:.1f} vocalizations per second"
                     )
                     eta = (total_num_updates - n_mb_procd()) / processing_speed
                     eta_hours = int(eta // 3600)
@@ -204,41 +206,55 @@ def train(
                         )
 
                     logger.info("")
+
+                    # MARK: debugging
+                    ############################################################
+                    # print("Finished iteration without issues")
+                    # exit(0)
+                    ############################################################
         # Validation period
         epoch += 1
         n_mb_processed_cur_epoch = 0
 
-        validation_targets = []
         validation_predictions = []
-        for batch in val_dloader:
-            opt.zero_grad()
+        with torch.no_grad():
+            for batch in val_dloader:
+                audio, labels = batch["audio"], batch["labels"]
+                audio = audio.cuda()
+                labels = labels.cuda()
+                aug_audio = augmentor(audio)
 
-            audio, labels = batch["audio"], batch["labels"]
-            rand_perm = torch.randperm(labels.shape[1])
-            audio = audio.cuda()
-            labels = labels[:, rand_perm, ...].cuda()
-            class_label = rand_perm.numpy().argmin()
+                # embeded_audio: (batch, features)
+                embedded_audio: torch.Tensor = audio_embedder(aug_audio)
+                # embedded_locations: (batch, 1 + num_negative, features)
+                embedded_locations: torch.Tensor = location_embedder(labels)
 
-            embedded_audio = model.embed_audio(audio)
-            embedded_locations = model.embed_location(labels)
+                # Make audio embeddings broadcastable
+                embedded_audio = embedded_audio.unsqueeze(1).expand_as(
+                    embedded_locations
+                )
+                # scores: (batch, 1 + num_negative)
+                scores = scorer(embedded_audio, embedded_locations)
+                predictions = scores.argmax(dim=1)
+                validation_predictions.extend(predictions.cpu().numpy())
 
-            scores = model.score_pairs(embedded_audio, embedded_locations)
-            predictions = scores.argmax(dim=1)
-
-            validation_targets.extend([class_label] * audio.shape[0])
-            validation_predictions.extend(predictions.detach().cpu().numpy())
-
-        validation_targets = np.array(validation_targets)
         validation_predictions = np.array(validation_predictions)
-        accuracy = (validation_targets == validation_predictions).mean()
+        print(f"Validation predictions shape: {validation_predictions.shape}")
+        accuracy = (validation_predictions == 0).mean()
+        append_loss([], [accuracy], save_directory)
         logger.info(f"Validation accuracy: {accuracy:.1%}")
 
         logger.info("Saving state")
         if not save_directory:
             logger.warn("No weights path specified, not saving")
         else:
-            wpath = save_directory / f"weights_{epoch}.pt"
-            torch.save(model.state_dict(), wpath)
+            a_wpath = save_directory / f"aembed_weights.pt"
+            l_wpath = save_directory / f"lembed_weights.pt"
+            s_wpath = save_directory / f"scorer_weights.pt"
+            torch.save(audio_embedder.state_dict(), a_wpath)
+            torch.save(location_embedder.state_dict(), l_wpath)
+            torch.save(scorer.state_dict(), s_wpath)
+            logger.info(f"Saved weights to {a_wpath}, {l_wpath}, {s_wpath}")
         logger.info("")
     logger.info("Done.")
 
@@ -247,92 +263,86 @@ def eval(
     config: dict,
     data_path: Path,
     save_directory: Path,
-    index: Optional[np.ndarray] = None,
+    index_path: Optional[Path] = None,
 ) -> None:
-    """Runs evaluation on a trained model."""
+    """Runs inference using a trained model. For each vocalization and location pair in the inference dataset,
+    this produces a distribution over scores for each of the candidate locations by contrasting them with
+    randomly sampled locations from other frames in the dataset.
 
-    # First find the most recent weights file
-    weights_files = list(save_directory.glob("weights_*.pt"))
-    weights_files.sort(key=lambda x: int(x.stem.split("_")[-1]))
-    weights_file = weights_files[-1]
+    Args:
+        config (dict): Model config
+        data_path (Path): Path to dataset
+        save_directory (Path): Directory containing model weights
+        index (Optional[np.ndarray], optional): Index of samples
+    to evaluate. Defaults to None, in which case, all vocalizations are processed
+    """
+    num_samples_per_vocalization = 1000
 
-    print(f"Loading weights from {weights_file}")
-    weights = torch.load(weights_file)
-    model: Wavenet = Wavenet(config)
-    model.load_state_dict(weights)
-    model.cuda()
-    model.eval()
+    # Check existence of weights
+    if not (save_directory / "aembed_weights.pt").exists():
+        raise FileNotFoundError("Audio embedder weights not found")
+    if not (save_directory / "lembed_weights.pt").exists():
+        raise FileNotFoundError("Location embedder weights not found")
+    if not (save_directory / "scorer_weights.pt").exists():
+        raise FileNotFoundError("Scorer weights not found")
+    if index_path is not None and not index_path.exists():
+        raise FileNotFoundError("Index file not found")
 
-    if index is None:
-        with h5py.File(data_path, "r") as ctx:
-            dset_size = len(ctx["length_idx"]) - 1
-            index = np.arange(dset_size)
+    if not torch.cuda.is_available():
+        raise RuntimeError("Cuda not available!")
 
-    dataloader = load_single_dataloader(config, data_path, index)
+    default_cfg = utils.get_default_config()
+    config = utils.update_recursively(config, default_cfg)
 
-    all_scores = []
-    for batch in tqdm(dataloader):
-        audio, labels = batch["audio"], batch["labels"]
-        audio = audio.cuda()
-        # labels should have shape (batch_size, num_animals, 6)
-        labels = labels.cuda()
+    audio_embedder: AudioEmbedder = utils.initialize_audio_embedder(config)
+    audio_embedder.cuda()
+    location_embedder: LocationEmbedding = utils.initialize_location_embedding(config)
+    location_embedder.cuda()
+    scorer = utils.initialize_scorer(config)
+    scorer.cuda()
 
-        if labels.shape[-2] == 1:
-            raise ValueError("Only one animal in the dataset, cannot evaluate.")
-        if labels.shape[-1] != model.location_input_dims:
-            raise ValueError(
-                f"Expected {model.location_input_dims} location dimensions, got {labels.shape[-1]}"
-            )
-
-        embedded_audio = model.embed_audio(audio)
-        embedded_locations = model.embed_location(labels)
-
-        scores = model.score_pairs(embedded_audio, embedded_locations)
-        # scores = F.softmax(scores, dim=1)
-        all_scores.append(scores.detach().cpu().numpy())
-
-    all_scores = np.concatenate(all_scores, axis=0)
-    output_fname = data_path.stem + "_scores.npy"
-    np.save(save_directory / output_fname, all_scores)
-
-
-def load_single_dataloader(config: dict, data_path: Path, index: np.ndarray):
-    arena_dims = config["DATA"]["ARENA_DIMS"]
-    batch_size = config["DATA"]["BATCH_SIZE"]
-    crop_length = config["DATA"]["CROP_LENGTH"]
-    normalize_data = config["DATA"].get("NORMALIZE_DATA", True)
-    sample_rate = config["DATA"].get("SAMPLE_RATE", 192000)
-    node_names = config["DATA"].get("NODES_TO_LOAD", None)
-
-    vocalization_dir = config["DATA"].get(
-        "VOCALIZATION_DIR",
-        None,
+    audio_embedder.load_state_dict(
+        torch.load(save_directory / "aembed_weights.pt", weights_only=True), strict=True
+    )
+    location_embedder.load_state_dict(
+        torch.load(save_directory / "lembed_weights.pt", weights_only=True), strict=True
+    )
+    scorer.load_state_dict(
+        torch.load(save_directory / "scorer_weights.pt", weights_only=True), strict=True
     )
 
-    dataset = VocalizationDataset(
-        data_path,
-        arena_dims=arena_dims,
-        crop_length=crop_length,
-        inference=True,
-        index=index,
-        normalize_data=normalize_data,
-        sample_rate=sample_rate,
-        sample_vocalization_dir=vocalization_dir,
-        nodes=node_names,
+    dset = utils.initialize_inference_dataset(config, data_path, index_path)
+    _, n_mice, n_nodes, n_dims = dset[0][1].shape
+
+    output_scores = np.empty(
+        (len(dset), n_mice, num_samples_per_vocalization), dtype=np.float32
     )
 
-    try:
-        # I think this function only exists on linux
-        avail_cpus = max(1, len(os.sched_getaffinity(0)) - 1)
-    except:
-        avail_cpus = max(1, os.cpu_count() - 1)
+    with torch.no_grad():
+        for idx in tqdm(range(len(dset))):
+            audio, location = dset[idx]
+            audio = audio.cuda().unsqueeze(0)  # (1, time, channels)
+            location = location.cuda()  # (1, n_mice, n_nodes, n_dims)
+            audio_embedding = audio_embedder(audio)  # (1, features)
 
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        num_workers=avail_cpus,
-        shuffle=False,
-        collate_fn=dataset.collate,
-    )
+            for mouse_idx in range(2):
+                fake_location_batch = (
+                    dset.sample_rand_locations(num_samples_per_vocalization)
+                    .unsqueeze(1)
+                    .cuda()
+                )  # (num_samples, 1, n_nodes, n_dims)
+                lembed_input = (
+                    location[:, mouse_idx, :, :]
+                    .unsqueeze(1)
+                    .expand_as(fake_location_batch)
+                )
+                lembed_input = torch.cat(
+                    [lembed_input, fake_location_batch], dim=1
+                )  # (num_samples, 2, n_nodes, n_dims)
+                lembeddings = location_embedder(lembed_input)  # (num_samples, features)
+                scores = scorer(
+                    audio_embedding.expand_as(lembeddings), lembeddings
+                )  # (num_samples,)
+                output_scores[idx, mouse_idx, :] = scores.cpu().numpy()
 
-    return dataloader
+    np.save(save_directory / "output_scores.npy", output_scores)

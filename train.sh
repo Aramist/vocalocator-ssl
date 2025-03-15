@@ -15,7 +15,7 @@ dataset_path=/mnt/home/atanelus/ceph/neurips_datasets/audio/sologerbil-4m-e1_aud
 config_path=/mnt/home/atanelus/configs/4mic_mc.json5
 
 echo "Running training"
-python -u -m contrastive  \
+python -u -m vocalocatorssl  \
     --data $dataset_path \
     --config $config_path \
     --save-path ~/ceph/gerbilizer/gcontrastive

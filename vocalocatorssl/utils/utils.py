@@ -7,11 +7,11 @@ import torch
 from torch import nn, optim
 from torch.nn import functional as F
 
-from .affinity import AffinityScorer, CosineSimilarityScorer, MLPScorer
 from .architectures import AudioEmbedder, ResnetConformer, SimpleNet, Wavenet
 from .augmentations import AugmentationConfig, build_augmentations
 from .dataloaders import VocalizationDataset, build_dataloaders, build_inference_dataset
 from .embeddings import FourierEmbedding, LocationEmbedding, MLPEmbedding
+from .scorers import AffinityScorer, CosineSimilarityScorer, MLPScorer
 
 global_logger: tp.Optional[logging.Logger] = None
 

@@ -87,6 +87,8 @@ class FourierEmbedding(LocationEmbedding):
             torch.zeros(d_input, d_embedding // 2), requires_grad=True
         )
 
+        self.rng = np.random.default_rng()
+
         self.init_weights()
 
     def init_weights(self) -> None:
@@ -111,6 +113,9 @@ class FourierEmbedding(LocationEmbedding):
                 raise ValueError(
                     f"Expected {self.num_locations} locations, got {locations.shape[-2]}"
                 )
+            # Shuffle the locations to avoid overfitting to the order
+            perm = self.rng.permutation(self.num_locations)
+            locations = locations[:, perm]
             locations = locations.view(*locations.shape[:-3], -1)
             # resulting shape: (*batch, d_location * num_locations)
         else:

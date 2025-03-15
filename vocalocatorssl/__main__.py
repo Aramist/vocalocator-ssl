@@ -32,4 +32,4 @@ if __name__ == "__main__":
     if args.eval:
         eval(config, args.data, args.save_path, args.index)
     else:
-        training_loop(config, args.data, args.save_path)
+        training_loop(config, args.data, args.save_path, args.index)

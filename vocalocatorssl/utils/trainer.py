@@ -54,17 +54,15 @@ def append_loss(
 def training_loop(
     config: dict,
     data_path: Path,
-    save_directory: Optional[Path] = None,
+    save_directory: Path,
+    index_dir: Optional[Path] = None,
 ):
     if not torch.cuda.is_available():
         raise RuntimeError("Cuda not available!")
 
     # Get logger
-    if not save_directory:
-        print("No save directory specified, not saving model checkpoints.")
-        log_path = Path("train_log.log")
-    else:
-        log_path = save_directory / "train_log.log"
+    save_directory.mkdir(exist_ok=True, parents=True)
+    log_path = save_directory / "train_log.log"
     logger = utils.initialize_logger(log_path)
 
     default_cfg = utils.get_default_config()
@@ -87,20 +85,18 @@ def training_loop(
     augmentor = utils.initialize_augmentations(config)
     # loss_fn = utils.initialize_loss_function(config)
     train_dloader, val_dloader, test_dloader = utils.initialize_dataloaders(
-        config, data_path, index_path=None
+        config, data_path, index_path=index_dir
     )
-
-    print(f"Validation dataset size: {val_dloader.dataset.__len__()}")
 
     if save_directory is not None:
         with open(save_directory / "config.json", "w") as ctx:
             json.dump(config, ctx, indent=4)
         index_dir = save_directory / "indices"
         index_dir.mkdir(exist_ok=True)
-        np.save(save_directory / "train_idx.npy", train_dloader.dataset.index)
-        np.save(save_directory / "val_idx.npy", val_dloader.dataset.index)
+        np.save(index_dir / "train_idx.npy", train_dloader.dataset.index)
+        np.save(index_dir / "val_idx.npy", val_dloader.dataset.index)
         if test_dloader is not None:
-            np.save(save_directory / "test_idx.npy", test_dloader.dataset.index)
+            np.save(index_dir / "test_idx.npy", test_dloader.dataset.index)
 
     total_num_updates = config["optimization"]["num_weight_updates"]
 
@@ -139,6 +135,15 @@ def training_loop(
                 labels = labels.cuda()
                 aug_audio = augmentor(audio)
 
+                # Shuffle the positive and negative labels
+                positive_label_idx = torch.randint(
+                    0, labels.shape[1], (labels.shape[0],)
+                ).cuda()
+                # Swap the current positive label (at 0) with the randomly selected index
+                cur_negatives = labels[range(labels.shape[0]), positive_label_idx, ...]
+                labels[range(labels.shape[0]), positive_label_idx, ...] = labels[:, 0]
+                labels[:, 0] = cur_negatives
+
                 # embeded_audio: (batch, features)
                 embedded_audio: torch.Tensor = audio_embedder(aug_audio)
                 # embedded_locations: (batch, 1 + num_negative, features)
@@ -152,7 +157,7 @@ def training_loop(
                 scores = scorer(embedded_audio, embedded_locations)
                 loss = F.cross_entropy(
                     scores,
-                    torch.zeros(scores.shape[0], dtype=torch.long).cuda(),
+                    positive_label_idx,
                     reduction="none",
                 )  # (batch,)
 
@@ -207,11 +212,6 @@ def training_loop(
 
                     logger.info("")
 
-                    # MARK: debugging
-                    ############################################################
-                    # print("Finished iteration without issues")
-                    # exit(0)
-                    ############################################################
         # Validation period
         epoch += 1
         n_mb_processed_cur_epoch = 0
@@ -221,8 +221,19 @@ def training_loop(
             for batch in val_dloader:
                 audio, labels = batch["audio"], batch["labels"]
                 audio = audio.cuda()
-                labels = labels.cuda()
+                labels = (
+                    labels.cuda()
+                )  # (batch, 1 + num_negative, n_mice, n_nodes, n_dims)
                 aug_audio = augmentor(audio)
+
+                # Shuffle the position of the ground truth label
+                ground_truth_index = torch.randint(
+                    0, labels.shape[1], (labels.shape[0],)
+                ).cuda()
+                # Swap the ground truth label with the first label
+                cur_negative = labels[range(labels.shape[0]), ground_truth_index, ...]
+                labels[range(labels.shape[0]), ground_truth_index, ...] = labels[:, 0]
+                labels[:, 0] = cur_negative
 
                 # embeded_audio: (batch, features)
                 embedded_audio: torch.Tensor = audio_embedder(aug_audio)
@@ -236,11 +247,12 @@ def training_loop(
                 # scores: (batch, 1 + num_negative)
                 scores = scorer(embedded_audio, embedded_locations)
                 predictions = scores.argmax(dim=1)
-                validation_predictions.extend(predictions.cpu().numpy())
+                validation_predictions.extend(
+                    (predictions == ground_truth_index).cpu().numpy()
+                )
 
         validation_predictions = np.array(validation_predictions)
-        print(f"Validation predictions shape: {validation_predictions.shape}")
-        accuracy = (validation_predictions == 0).mean()
+        accuracy = validation_predictions.mean()
         append_loss([], [accuracy], save_directory)
         logger.info(f"Validation accuracy: {accuracy:.1%}")
 
@@ -318,6 +330,8 @@ def eval(
         (len(dset), n_mice, num_samples_per_vocalization), dtype=np.float32
     )
 
+    all_saved_locations = []
+
     with torch.no_grad():
         for idx in tqdm(range(len(dset))):
             audio, location = dset[idx]
@@ -325,12 +339,14 @@ def eval(
             location = location.cuda()  # (1, n_mice, n_nodes, n_dims)
             audio_embedding = audio_embedder(audio)  # (1, features)
 
+            saved_locations = []
             for mouse_idx in range(2):
                 fake_location_batch = (
                     dset.sample_rand_locations(num_samples_per_vocalization)
                     .unsqueeze(1)
                     .cuda()
                 )  # (num_samples, 1, n_nodes, n_dims)
+                saved_locations.append(fake_location_batch.cpu().numpy())
                 lembed_input = (
                     location[:, mouse_idx, :, :]
                     .unsqueeze(1)
@@ -344,5 +360,7 @@ def eval(
                     audio_embedding.expand_as(lembeddings), lembeddings
                 )  # (num_samples,)
                 output_scores[idx, mouse_idx, :] = scores.cpu().numpy()
+            all_saved_locations.append(np.array(saved_locations))
 
+    np.save(save_directory / "locs.npy", np.array(all_saved_locations))
     np.save(save_directory / "output_scores.npy", output_scores)

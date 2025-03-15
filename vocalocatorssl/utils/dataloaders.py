@@ -190,7 +190,7 @@ class VocalizationDataset(Dataset):
             # Lazily recreate the dataset object in the child process
             self.dataset = h5py.File(self.datapath, "r")
 
-        indices = self.rng.choice(len(self.dataset), num, replace=True)
+        indices = self.rng.choice(len(self.dataset["locations"]), num, replace=True)
         labels = torch.stack([self.__label_for_index(idx) for idx in indices])
         # Labels shape: (num, n_mice, n_nodes, n_dims)
         # May have more than one mouse in each location, randomly choose one per location
@@ -198,7 +198,7 @@ class VocalizationDataset(Dataset):
             self.rng.integers(0, labels.shape[1], size=(num,))
         )
         labels = labels[torch.arange(num), mouse_choices, ...]
-        return labels  # Shape: (num, n_nodes, n_dims)
+        return self.scale_labels(labels)  # Shape: (num, n_nodes, n_dims)
 
     # TODO: Decide how to scale difficulty in multi-animal datasets
     # @property

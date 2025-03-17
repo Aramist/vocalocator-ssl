@@ -8,7 +8,7 @@ version = "0.0.1"
 authors = [
   { name="NeuroStats Lab" },
 ]
-description = "Tool for sound-source localization of vocal calls"
+description = "Tool for self-supervised sound-source localization of vocal calls"
 readme = "README.md"
 requires-python = ">=3.9"
 classifiers = [
@@ -24,6 +24,7 @@ dependencies = [
     "pyjson5>=1.6.0",
     "scipy>=1.11.0",
     "torch>=2.0.0",
+    "lightning>=2.4.0",
 ]
 
 [project.urls]

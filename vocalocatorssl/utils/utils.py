@@ -11,7 +11,7 @@ from .architectures import AudioEmbedder, ResnetConformer, SimpleNet, Wavenet
 from .augmentations import AugmentationConfig, build_augmentations
 from .dataloaders import VocalizationDataset, build_dataloaders, build_inference_dataset
 from .embeddings import FourierEmbedding, LocationEmbedding, MLPEmbedding
-from .scorers import AffinityScorer, CosineSimilarityScorer, MLPScorer
+from .scorers import CosineSimilarityScorer, MLPScorer, Scorer
 
 global_logger: tp.Optional[logging.Logger] = None
 
@@ -117,7 +117,9 @@ def update_recursively(dictionary: dict, defaults: dict) -> dict:
     return dictionary
 
 
-def initialize_optimizer(config: dict, params: list | dict) -> optim.Optimizer:
+def initialize_optimizer(
+    config: dict, params: list | dict | tp.Iterator[nn.Parameter]
+) -> optim.Optimizer:
     """Initializes an optimizer based on the configuration. References the `optimization/optimizer` key
     to determine the optimizer type and the `optimization/*` keys to determine the optimizer specific
     hyperparameters.
@@ -159,7 +161,7 @@ def initialize_optimizer(config: dict, params: list | dict) -> optim.Optimizer:
     return opt
 
 
-def initialize_scorer(config: dict) -> AffinityScorer:
+def initialize_scorer(config: dict) -> Scorer:
     """Initializes the scorer module based on the configuration. This is a module
     which takes in audio and location embeddings and produces a score representing
     how well the audio and location embeddings match.

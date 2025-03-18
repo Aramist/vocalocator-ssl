@@ -33,10 +33,7 @@ def train_default(
     )
 
     model = LVocalocator(config)
-    num_nodes = os.getenv("NUM_NODES", 1)
-    num_nodes = int(num_nodes)
     trainer = L.Trainer(
-        num_nodes=num_nodes,
         max_steps=config["optimization"]["num_weight_updates"],
         default_root_dir=save_directory,
         # check_val_every_n_epoch=config["optimization"]["weight_updates_per_epoch"],

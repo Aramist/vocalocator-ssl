@@ -110,6 +110,19 @@ class LVocalocator(L.LightningModule):
         self.log("val_acc", acc, on_step=True, on_epoch=True, sync_dist=True)
         return acc
 
+    def predict_step(self, batch: dict[str, torch.Tensor], *args: Any) -> torch.Tensor:
+        """Computes score distributions for each candidate source location for each
+        sound in the batch.
+
+        Args:
+            batch (dict[str, torch.Tensor]): Batch of audio samples and candidate locations
+
+        Returns:
+            torch.Tensor: Score distributions for each candidate location (batch, num_animals, num_samples)
+        """
+        num_samples = self.config["inference"]["num_samples_per_vocalization"]
+        pass
+
     def configure_optimizers(self):
         """Configures the optimizer and learning rate scheduler. This is a bit complicated
         becasue I want to use a cosine decay schedule with a warmup period.

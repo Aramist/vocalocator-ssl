@@ -11,36 +11,6 @@ from tqdm import tqdm
 from . import utils
 from .architectures import AudioEmbedder
 from .embeddings import LocationEmbedding
-from .lightning_wrappers import LVocalocator
-
-
-def training_loop(
-    config: dict,
-    data_path: Path,
-    save_directory: Path,
-    index_dir: Optional[Path] = None,
-):
-    save_directory.mkdir(exist_ok=True, parents=True)
-
-    default_cfg = utils.get_default_config()
-    config = utils.update_recursively(config, default_cfg)
-
-    train_dloader, val_dloader, _ = utils.initialize_dataloaders(
-        config, data_path, index_path=index_dir
-    )
-
-    model = LVocalocator(config)
-    num_nodes = os.getenv("NUM_NODES", 1)
-    num_nodes = int(num_nodes)
-    trainer = L.Trainer(
-        num_nodes=num_nodes,
-        max_steps=config["optimization"]["num_weight_updates"],
-        default_root_dir=save_directory,
-        # check_val_every_n_epoch=config["optimization"]["weight_updates_per_epoch"],
-        log_every_n_steps=1,
-    )
-
-    trainer.fit(model, train_dloader, val_dloader)
 
 
 def eval(

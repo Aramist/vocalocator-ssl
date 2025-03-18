@@ -1,36 +1,13 @@
-import logging
-import sys
 import typing as tp
 from pathlib import Path
 
-import torch
 from torch import nn, optim
-from torch.nn import functional as F
 
 from .architectures import AudioEmbedder, ResnetConformer, SimpleNet, Wavenet
 from .augmentations import AugmentationConfig, build_augmentations
 from .dataloaders import VocalizationDataset, build_dataloaders, build_inference_dataset
 from .embeddings import FourierEmbedding, LocationEmbedding, MLPEmbedding
 from .scorers import CosineSimilarityScorer, MLPScorer, Scorer
-
-global_logger: tp.Optional[logging.Logger] = None
-
-
-def initialize_logger(log_path: Path) -> logging.Logger:
-    global global_logger
-    global_logger = logging.getLogger("train_logger")
-    global_logger.setLevel(logging.INFO)
-    formatter = logging.Formatter("%(asctime)s - %(message)s")
-    fh = logging.FileHandler(log_path)
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(formatter)
-    global_logger.addHandler(fh)
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setLevel(logging.INFO)
-    sh.setFormatter(formatter)
-    global_logger.addHandler(sh)
-
-    return global_logger
 
 
 def get_default_config() -> dict:
@@ -89,22 +66,11 @@ def get_default_config() -> dict:
             "noise_injection_snr_min": 5,
             "noise_injection_snr_max": 12,
         },
+        "inference": {
+            "num_samples_per_vocalization": 1000,
+        },
     }
     return DEFAULT_CONFIG
-
-
-def get_mem_usage() -> str:
-    """Returns a string describing the current GPU memory usage.
-
-    Returns:
-        str: Memory usage formatted in GiB
-    """
-    if not torch.cuda.is_available():
-        return ""
-    used_gb = torch.cuda.max_memory_allocated() / (2**30)
-    total_gb = torch.cuda.get_device_properties(0).total_memory / (2**30)
-    torch.cuda.reset_peak_memory_stats()
-    return "Max mem. usage: {:.2f}/{:.2f}GiB".format(used_gb, total_gb)
 
 
 def update_recursively(dictionary: dict, defaults: dict) -> dict:
@@ -197,42 +163,6 @@ def initialize_scorer(config: dict) -> Scorer:
         )
 
     return scorer
-
-
-def initialize_loss_function(
-    config: dict,
-) -> tp.Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
-    """Initializes the loss function based on the configuration.
-    References the `loss_function` key to determine the loss function type.
-
-    Args:
-        config (dict): Configuration dictionary
-
-    Raises:
-        ValueError: If no loss function is specified
-        ValueError: If the loss function is not recognized
-
-    Returns:
-        tp.Callable[[torch.Tensor, torch.Tensor], torch.Tensor]: Loss function which accepts a tensor of
-        positive scores (B,) and a tensor of negative scores (B, N) and returns a scalar loss value per
-        batch element (B,)
-    """
-    loss_function = config.get("loss_function", None)
-    if loss_function is None:
-        raise ValueError("No loss function specified in config.")
-
-    if loss_function == "crossentropy":
-
-        def cl_loss(pos_scores, neg_scores):
-            """Wraps cross entropy loss to accept positive and negative scores"""
-            return F.cross_entropy(
-                torch.cat([pos_scores.unsqueeze(1), neg_scores], dim=1),
-                torch.zeros(pos_scores.size(0), dtype=torch.long).cuda(),
-            )
-
-        return cl_loss
-    else:
-        raise ValueError(f"Unrecognized loss function {loss_function}")
 
 
 def initialize_augmentations(config: dict) -> nn.Module:

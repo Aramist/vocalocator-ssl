@@ -1,16 +1,49 @@
 import argparse
+import os
+import typing as tp
 from pathlib import Path
 
-import numpy as np
+import lightning as L
 import pyjson5 as json
 
-from .utils.trainer import eval, training_loop
+from .src import utils as utilsmodule
+from .src.lightning_wrappers import LVocalocator
+from .src.trainer import eval
 
 
 def load_json(path: Path) -> dict:
     with open(path, "rb") as ctx:
         data = json.load(ctx)
     return data
+
+
+def train_default(
+    config: dict,
+    data_path: Path,
+    save_directory: Path,
+    index_dir: tp.Optional[Path] = None,
+):
+    save_directory.mkdir(exist_ok=True, parents=True)
+
+    default_cfg = utilsmodule.get_default_config()
+    config = utilsmodule.update_recursively(config, default_cfg)
+
+    train_dloader, val_dloader, _ = utilsmodule.initialize_dataloaders(
+        config, data_path, index_path=index_dir
+    )
+
+    model = LVocalocator(config)
+    num_nodes = os.getenv("NUM_NODES", 1)
+    num_nodes = int(num_nodes)
+    trainer = L.Trainer(
+        num_nodes=num_nodes,
+        max_steps=config["optimization"]["num_weight_updates"],
+        default_root_dir=save_directory,
+        # check_val_every_n_epoch=config["optimization"]["weight_updates_per_epoch"],
+        log_every_n_steps=1,
+    )
+
+    trainer.fit(model, train_dloader, val_dloader)
 
 
 if __name__ == "__main__":
@@ -32,4 +65,4 @@ if __name__ == "__main__":
     if args.eval:
         eval(config, args.data, args.save_path, args.index)
     else:
-        training_loop(config, args.data, args.save_path, args.index)
+        train_default(config, args.data, args.save_path, args.index)

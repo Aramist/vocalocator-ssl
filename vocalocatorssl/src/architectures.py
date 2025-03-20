@@ -7,7 +7,6 @@ from torch.nn import functional as F
 from torchaudio.functional import convolve
 from torchaudio.models import Conformer
 
-from .profiling import record
 from .resnet1d import ResNet1D
 
 
@@ -230,7 +229,6 @@ class Wavenet(AudioEmbedder):
 
         return torch.cat(xcorrs, dim=-1)
 
-    @record
     def embed_audio(self, audio: torch.Tensor):
         """Embeds multi-channel audio into a fixed-size representation
 
@@ -326,7 +324,6 @@ class SimpleNet(AudioEmbedder):
         self.final_pooling = nn.AdaptiveAvgPool1d(1)
         self.final_linear = nn.Linear(conv_channels[-1], d_embedding)
 
-    @record
     def embed_audio(self, audio: torch.Tensor) -> torch.Tensor:
         audio = audio.transpose(
             -1, -2
@@ -387,7 +384,6 @@ class ResnetConformer(AudioEmbedder):
             nn.Linear(512, d_embedding),
         )
 
-    @record
     def embed_audio(self, audio: torch.Tensor) -> torch.Tensor:
         audio = torch.transpose(
             audio, -1, -2

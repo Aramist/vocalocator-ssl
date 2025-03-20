@@ -20,23 +20,28 @@ class VocalizationDataset(Dataset):
         self,
         dataset_path: Union[Path, str],
         *,
-        crop_length: int,
-        num_negative_samples: int = 1,
-        nodes: Optional[list[str]] = None,
-        inference: bool = False,
         arena_dims: Optional[Union[np.ndarray, list[float]]] = None,
+        nodes: Optional[list[str]] = None,
+        crop_length: int,
+        crop_randomly: bool = False,
+        num_negative_samples: int = 1,
         index: Optional[np.ndarray] = None,
         normalize_data: bool = True,
+        inference: bool = False,
         # difficulty_range: Optional[tuple[float, float]] = None,
         # num_difficulty_steps: int = 80_000,
     ):
         """
         Args:
-            datapath (Path): Path to HDF5 dataset
-            inference (bool, optional): When true, data will be cropped deterministically. Defaults to False.
-            crop_length (int): Length of audio samples to return.
+            dataset_path (Path): Path to HDF5 dataset
             arena_dims (Optional[Union[np.ndarray, Tuple[float, float]]], optional): Dimensions of the arena in mm. Used to scale labels.
+            nodes (Optional[list[str]], optional): List of skeleton nodes to retrieve from the dataset. Defaults to None, which will retrieve only the first node.
+            crop_length (int): Length of audio samples to return.
+            crop_randomly (bool, optional): When false, data will be cropped starting at the first sample. Defaults to False.
+            num_negative_samples (int, optional): Number of negative samples to retrieve for each positive example. Defaults to 1.
             index (Optional[np.ndarray], optional): An array of indices to use for this dataset. Defaults to None, which will use the full dataset
+            normalize_data (bool, optional): Whether to normalize the audio data to have zero mean and unit variance. Defaults to True.
+            inference (bool, optional): Whether this dataset is for inference. Defaults to False
         """
         if isinstance(dataset_path, str):
             dataset_path = Path(dataset_path)
@@ -54,7 +59,7 @@ class VocalizationDataset(Dataset):
         if "length_idx" not in dataset or "audio" not in dataset:
             raise ValueError("Improperly formatted dataset")
 
-        self.inference: bool = inference
+        self.crop_randomly: bool = crop_randomly
         self.arena_dims: np.ndarray = arena_dims
         self.crop_length: int = crop_length
         self.num_negative_samples: int = num_negative_samples
@@ -62,6 +67,7 @@ class VocalizationDataset(Dataset):
             index if index is not None else np.arange(len(dataset["length_idx"]) - 1)
         )
         self.normalize_data: bool = normalize_data
+        self.inference: bool = inference
         # self.difficulty_range: Optional[tuple[float, float]] = difficulty_range
         # self.source_point_index: Optional[KDTree] = None
         # self.num_difficulty_steps: int = num_difficulty_steps
@@ -113,12 +119,14 @@ class VocalizationDataset(Dataset):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: The audio and locations (+ and -) for
         the index. Audio is of shape (n_samples, n_channels).
-        Locations are of shape (n_negative + 1, n_mice, n_nodes, n_dims)
+        Locations are of shape (n_negative + 1, n_animals, n_nodes, n_dims)
         """
         if self.dataset is None:
             # Lazily recreate the dataset object in the child process
             self.dataset = h5py.File(self.datapath, "r")
         true_idx = self.index[idx]
+        if self.inference:
+            return self.__inference_data_for_index__(true_idx)
         return self.__processed_data_for_index__(true_idx)
 
     def __make_crop(self, audio: torch.Tensor, crop_length: int) -> torch.Tensor:
@@ -131,7 +139,7 @@ class VocalizationDataset(Dataset):
             pad_size = crop_length - audio_len
             # will fail if input is numpy array
             return F.pad(audio, (0, 0, 0, pad_size))
-        if self.inference:
+        if self.crop_randomly:
             range_start = 0  # Ensure the output is deterministic at inference time
         else:
             range_start = self.rng.integers(0, valid_range)
@@ -153,7 +161,7 @@ class VocalizationDataset(Dataset):
             idx (int): Index of the vocalization
 
         Returns:
-            torch.Tensor: The source location of the vocalization, if available. Shape: (n_mice, n_node, n_dim)
+            torch.Tensor: The source location of the vocalization, if available. Shape: (n_animals, n_node, n_dim)
         """
 
         locs = self.dataset["locations"][idx, ..., self.node_indices, :]
@@ -168,7 +176,7 @@ class VocalizationDataset(Dataset):
             idx (int): True index of the positive sample in the dataset
 
         Returns:
-            torch.Tensor: The negative sample. Shape: (n_mice, n_node, n_dim)
+            torch.Tensor: The negative sample. Shape: (n_animals, n_node, n_dim)
         """
 
         choices = np.delete(self.index, self.inverse_index[idx])
@@ -192,12 +200,12 @@ class VocalizationDataset(Dataset):
 
         indices = self.rng.choice(len(self.dataset["locations"]), num, replace=True)
         labels = torch.stack([self.__label_for_index(idx) for idx in indices])
-        # Labels shape: (num, n_mice, n_nodes, n_dims)
-        # May have more than one mouse in each location, randomly choose one per location
-        mouse_choices = torch.from_numpy(
+        # Labels shape: (num, n_animals, n_nodes, n_dims)
+        # May have more than one animal in each location, randomly choose one per location
+        animal_choices = torch.from_numpy(
             self.rng.integers(0, labels.shape[1], size=(num,))
         )
-        labels = labels[torch.arange(num), mouse_choices, ...]
+        labels = labels[torch.arange(num), animal_choices, ...]
         return self.scale_labels(labels)  # Shape: (num, n_nodes, n_dims)
 
     # TODO: Decide how to scale difficulty in multi-animal datasets
@@ -292,7 +300,7 @@ class VocalizationDataset(Dataset):
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: The audio and locations (+ and -) for
         the index. Audio is of shape (n_samples, n_channels).
-        Locations are of shape (n_negative + 1, n_mice, n_nodes, n_dims)
+        Locations are of shape (n_negative + 1, n_animals, n_nodes, n_dims)
         """
         sound = self.__audio_for_index(idx)
         sound = self.__make_crop(sound, self.crop_length)
@@ -306,6 +314,64 @@ class VocalizationDataset(Dataset):
 
         return sound, locations
 
+    def __inference_data_for_index__(
+        self, idx: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Gets the audio and locations for inference. This differs from standard procedure in that
+        for each true location, a set of random locations are also returned.
+
+        Args:
+            idx (int): _description_
+
+        Returns:
+            Audio (torch.Tensor): Audio sample for the index
+            Locations (torch.Tensor): A (n_animals, n_samples, n_animals, n_nodes, n_dims) tensor of locations. Index `i`
+                along the first dimension indicates that animal index `i` (in dimension 2) is the true location from
+                that index and all other locations are random.
+        """
+
+        sound = self.__audio_for_index(idx)
+        sound = self.__make_crop(sound, self.crop_length)
+
+        true_label = self.__label_for_index(idx)  # Shape: (n_animals, n_nodes, n_dims)
+        num_animals, n_nodes, n_dims = true_label.shape
+        labels_with_rands = torch.empty(
+            (
+                num_animals,
+                self.num_negative_samples,
+                num_animals,
+                true_label.shape[1],
+                true_label.shape[2],
+            ),
+            dtype=true_label.dtype,
+        )
+
+        for animal_idx in range(num_animals):
+            true_loc = true_label[animal_idx, ...]  # Shape: (n_nodes, n_dims)
+            # Sample random locations for each animal
+            random_labels = self.sample_rand_locations(
+                self.num_negative_samples * (num_animals - 1)
+            ).reshape(self.num_negative_samples, num_animals - 1, n_nodes, n_dims)
+
+            true_loc = true_loc.unsqueeze(0).expand(
+                self.num_negative_samples, -1, -1
+            )  # (samps, 1, nodes, dims)
+            # Insert at index `animal_idx` in dimension 2 of labels_with_rands
+            labels_with_rands[animal_idx, :, :animal_idx, ...] = random_labels[
+                :, :animal_idx, ...
+            ]
+            labels_with_rands[animal_idx, :, animal_idx, ...] = true_loc
+            labels_with_rands[animal_idx, :, animal_idx + 1 :, ...] = random_labels[
+                :, animal_idx:, ...
+            ]
+
+        sound, labels_with_rands = (
+            self.scale_audio(sound),
+            self.scale_labels(labels_with_rands),
+        )
+
+        return sound, labels_with_rands
+
     def collate(self, batch) -> dict[str, torch.Tensor]:
         """Collate function for the dataloader. Takes a list of (audio, label) tuples and returns
         a batch of audio and labels.
@@ -315,7 +381,7 @@ class VocalizationDataset(Dataset):
         labels = torch.stack(labels)
 
         # Audio should end up with shape (batch, channels, time)
-        # Labels should end up with shape (batch, 1 + num_false, n_mice, n_nodes, n_dims)
+        # Labels should end up with shape (batch, 1 + num_false, n_animals, n_nodes, n_dims)
         return {"audio": audio, "labels": labels}
 
 
@@ -408,7 +474,7 @@ def build_dataloaders(
         arena_dims=arena_dims,
         crop_length=crop_length,
         num_negative_samples=num_negative_samples,
-        inference=True,
+        crop_randomly=True,
         index=data_split_indices["val"],
         normalize_data=normalize_data,
         nodes=node_names,
@@ -439,7 +505,7 @@ def build_dataloaders(
             test_path,
             arena_dims=arena_dims,
             crop_length=crop_length,
-            inference=True,
+            crop_randomly=True,
             index=data_split_indices["test"],
             normalize_data=normalize_data,
         )
@@ -462,7 +528,8 @@ def build_inference_dataset(
     crop_length: int,
     normalize_data: bool,
     node_names: list[str],
-) -> VocalizationDataset:
+    distribution_sample_size: int,
+) -> DataLoader:
     """Constructs a single dataset for performing inference on a dataset.
 
     Args:
@@ -487,10 +554,19 @@ def build_inference_dataset(
         dataset_path,
         arena_dims=arena_dims,
         crop_length=crop_length,
+        crop_randomly=True,  # Todo: Experiment with this
         inference=True,
         index=indices,
         normalize_data=normalize_data,
         nodes=node_names,
-        num_negative_samples=0,
+        num_negative_samples=distribution_sample_size,
     )
-    return inference_dataset
+
+    loader = DataLoader(
+        inference_dataset,
+        batch_size=1,
+        num_workers=get_logical_cores(),
+        shuffle=False,
+        collate_fn=inference_dataset.collate,
+    )
+    return loader

@@ -1,36 +1,14 @@
-import logging
-import sys
 import typing as tp
 from pathlib import Path
 
-import torch
 from torch import nn, optim
-from torch.nn import functional as F
+from torch.utils.data import DataLoader
 
 from .architectures import AudioEmbedder, ResnetConformer, SimpleNet, Wavenet
 from .augmentations import AugmentationConfig, build_augmentations
 from .dataloaders import VocalizationDataset, build_dataloaders, build_inference_dataset
 from .embeddings import FourierEmbedding, LocationEmbedding, MLPEmbedding
-from .scorers import AffinityScorer, CosineSimilarityScorer, MLPScorer
-
-global_logger: tp.Optional[logging.Logger] = None
-
-
-def initialize_logger(log_path: Path) -> logging.Logger:
-    global global_logger
-    global_logger = logging.getLogger("train_logger")
-    global_logger.setLevel(logging.INFO)
-    formatter = logging.Formatter("%(asctime)s - %(message)s")
-    fh = logging.FileHandler(log_path)
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(formatter)
-    global_logger.addHandler(fh)
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setLevel(logging.INFO)
-    sh.setFormatter(formatter)
-    global_logger.addHandler(sh)
-
-    return global_logger
+from .scorers import CosineSimilarityScorer, MLPScorer, Scorer
 
 
 def get_default_config() -> dict:
@@ -73,6 +51,7 @@ def get_default_config() -> dict:
             "nodes_to_load": ["Nose", "Head"],
             "batch_size": 128,
             "num_negative_samples": 1,
+            "num_inference_samples": 1000,
             # "min_difficulty": 300,
             # "max_difficulty": 30,
             # "sample_rate": 250000,
@@ -89,22 +68,11 @@ def get_default_config() -> dict:
             "noise_injection_snr_min": 5,
             "noise_injection_snr_max": 12,
         },
+        "inference": {
+            "num_samples_per_vocalization": 1000,
+        },
     }
     return DEFAULT_CONFIG
-
-
-def get_mem_usage() -> str:
-    """Returns a string describing the current GPU memory usage.
-
-    Returns:
-        str: Memory usage formatted in GiB
-    """
-    if not torch.cuda.is_available():
-        return ""
-    used_gb = torch.cuda.max_memory_allocated() / (2**30)
-    total_gb = torch.cuda.get_device_properties(0).total_memory / (2**30)
-    torch.cuda.reset_peak_memory_stats()
-    return "Max mem. usage: {:.2f}/{:.2f}GiB".format(used_gb, total_gb)
 
 
 def update_recursively(dictionary: dict, defaults: dict) -> dict:
@@ -117,7 +85,9 @@ def update_recursively(dictionary: dict, defaults: dict) -> dict:
     return dictionary
 
 
-def initialize_optimizer(config: dict, params: list | dict) -> optim.Optimizer:
+def initialize_optimizer(
+    config: dict, params: list | dict | tp.Iterator[nn.Parameter]
+) -> optim.Optimizer:
     """Initializes an optimizer based on the configuration. References the `optimization/optimizer` key
     to determine the optimizer type and the `optimization/*` keys to determine the optimizer specific
     hyperparameters.
@@ -159,7 +129,7 @@ def initialize_optimizer(config: dict, params: list | dict) -> optim.Optimizer:
     return opt
 
 
-def initialize_scorer(config: dict) -> AffinityScorer:
+def initialize_scorer(config: dict) -> Scorer:
     """Initializes the scorer module based on the configuration. This is a module
     which takes in audio and location embeddings and produces a score representing
     how well the audio and location embeddings match.
@@ -195,42 +165,6 @@ def initialize_scorer(config: dict) -> AffinityScorer:
         )
 
     return scorer
-
-
-def initialize_loss_function(
-    config: dict,
-) -> tp.Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
-    """Initializes the loss function based on the configuration.
-    References the `loss_function` key to determine the loss function type.
-
-    Args:
-        config (dict): Configuration dictionary
-
-    Raises:
-        ValueError: If no loss function is specified
-        ValueError: If the loss function is not recognized
-
-    Returns:
-        tp.Callable[[torch.Tensor, torch.Tensor], torch.Tensor]: Loss function which accepts a tensor of
-        positive scores (B,) and a tensor of negative scores (B, N) and returns a scalar loss value per
-        batch element (B,)
-    """
-    loss_function = config.get("loss_function", None)
-    if loss_function is None:
-        raise ValueError("No loss function specified in config.")
-
-    if loss_function == "crossentropy":
-
-        def cl_loss(pos_scores, neg_scores):
-            """Wraps cross entropy loss to accept positive and negative scores"""
-            return F.cross_entropy(
-                torch.cat([pos_scores.unsqueeze(1), neg_scores], dim=1),
-                torch.zeros(pos_scores.size(0), dtype=torch.long).cuda(),
-            )
-
-        return cl_loss
-    else:
-        raise ValueError(f"Unrecognized loss function {loss_function}")
 
 
 def initialize_augmentations(config: dict) -> nn.Module:
@@ -328,7 +262,7 @@ def initialize_location_embedding(config: dict) -> LocationEmbedding:
 
 def initialize_dataloaders(
     config: dict, dataset_path: Path, index_path: tp.Optional[Path]
-):
+) -> tuple[DataLoader, DataLoader, tp.Optional[DataLoader]]:
     """Initializes the training, validation, and (optionally) test dataloaders.
 
     Args:
@@ -362,9 +296,9 @@ def initialize_dataloaders(
     return train_dloader, val_dloader, test_dloader
 
 
-def initialize_inference_dataset(
+def initialize_inference_dataloader(
     config: dict, dataset_path: Path, index_path: tp.Optional[Path]
-) -> VocalizationDataset:
+) -> DataLoader:
     """Initializes the inference dataset
 
     Args:
@@ -374,11 +308,14 @@ def initialize_inference_dataset(
     dataset to use for inference. If none is provided, the entire dataset will be used.
     """
 
-    return build_inference_dataset(
+    dataloader = build_inference_dataset(
         dataset_path,
         index_path,
         arena_dims=config["dataloader"]["arena_dims"],
         crop_length=config["dataloader"]["crop_length"],
         normalize_data=config["dataloader"].get("normalize_data", True),
         node_names=config["dataloader"].get("nodes_to_load", None),
+        distribution_sample_size=config["dataloader"]["num_inference_samples"],
     )
+
+    return dataloader

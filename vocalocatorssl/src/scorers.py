@@ -2,7 +2,7 @@ import torch
 from torch import nn
 
 
-class AffinityScorer(nn.Module):
+class Scorer(nn.Module):
     def __init__(self, d_audio_embed: int, d_location_embed: int):
         """Abstract class for scoring affinity between audio and location embeddings.
 
@@ -10,7 +10,7 @@ class AffinityScorer(nn.Module):
             d_audio_embed (int): Dimension of the audio embeddings
             d_location_embed (int): Dimension of the location embeddings
         """
-        super(AffinityScorer, self).__init__()
+        super(Scorer, self).__init__()
         self.d_audio_embed = d_audio_embed
         self.d_location_embed = d_location_embed
 
@@ -30,7 +30,7 @@ class AffinityScorer(nn.Module):
         raise NotImplementedError("Forward method must be implemented in subclass.")
 
 
-class CosineSimilarityScorer(AffinityScorer):
+class CosineSimilarityScorer(Scorer):
     def __init__(self, d_embedding: int):
         super(CosineSimilarityScorer, self).__init__(d_embedding, d_embedding)
 
@@ -53,7 +53,7 @@ class CosineSimilarityScorer(AffinityScorer):
         return (audio_embedding * location_embedding).sum(dim=-1)
 
 
-class MLPScorer(AffinityScorer):
+class MLPScorer(Scorer):
     def __init__(self, d_audio_embed: int, d_location_embed: int, d_hidden: int):
         """MLP based scorer for audio-location affinity.
 

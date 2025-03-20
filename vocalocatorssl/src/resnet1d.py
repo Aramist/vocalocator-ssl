@@ -3,6 +3,9 @@ resnet for 1-d signal data, pytorch version
 
 Shenda Hong, Oct 2019
 source: https://github.com/hsd1503/resnet1d/blob/master/resnet1d.py
+
+Modified by me to remove parameters that don't get used in the last layer
+Prevents issues with DDP
 """
 
 import torch
@@ -107,7 +110,8 @@ class BasicBlock(nn.Module):
         self.use_do = use_do
 
         # the first conv
-        self.bn1 = nn.BatchNorm1d(in_channels)
+        if not self.is_first_block:
+            self.bn1 = nn.BatchNorm1d(in_channels)
         self.relu1 = nn.ReLU()
         self.do1 = nn.Dropout(p=0.5)
         self.conv1 = MyConv1dPadSame(
@@ -278,11 +282,7 @@ class ResNet1D(nn.Module):
         out = x
 
         # first conv
-        if self.verbose:
-            print("input shape", out.shape)
         out = self.first_block_conv(out)
-        if self.verbose:
-            print("after first conv", out.shape)
         if self.use_bn:
             out = self.first_block_bn(out)
         out = self.first_block_relu(out)
@@ -290,15 +290,7 @@ class ResNet1D(nn.Module):
         # residual blocks, every block has two conv
         for i_block in range(self.n_block):
             net = self.basicblock_list[i_block]
-            if self.verbose:
-                print(
-                    "i_block: {0}, in_channels: {1}, out_channels: {2}, downsample: {3}".format(
-                        i_block, net.in_channels, net.out_channels, net.downsample
-                    )
-                )
             out = net(out)
-            if self.verbose:
-                print(out.shape)
 
         # final prediction
         if self.use_bn:
@@ -322,4 +314,8 @@ if __name__ == "__main__":
     # 4-channel audio, 1000 samples, batch of 32
     sample_data = torch.randn(32, 4, 1024)
     sample_output = test_resnet(sample_data)
+    sample_output.sum().backward()
+    for n, p in test_resnet.named_parameters():
+        if p.grad is None:
+            print(n)
     print(sample_output.shape)

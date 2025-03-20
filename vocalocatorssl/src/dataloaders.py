@@ -161,7 +161,7 @@ class VocalizationDataset(Dataset):
             idx (int): Index of the vocalization
 
         Returns:
-            torch.Tensor: The source location of the vocalization, if available. Shape: (n_animals, n_node, n_dim)
+            torch.Tensor: The source location of the vocalization, if available. Shape: (n_animals, n_node, n_dim). Unit: dataset unit
         """
 
         locs = self.dataset["locations"][idx, ..., self.node_indices, :]
@@ -176,7 +176,7 @@ class VocalizationDataset(Dataset):
             idx (int): True index of the positive sample in the dataset
 
         Returns:
-            torch.Tensor: The negative sample. Shape: (n_animals, n_node, n_dim)
+            torch.Tensor: The negative sample. Shape: (n_animals, n_node, n_dim). Unit: dataset unit
         """
 
         choices = np.delete(self.index, self.inverse_index[idx])
@@ -192,7 +192,7 @@ class VocalizationDataset(Dataset):
             num (int): Number of random locations to sample
 
         Returns:
-            torch.Tensor: Batch of scaled, random locations. Shape: (num, n_node, n_dim)
+            torch.Tensor: Batch of scaled, random locations. Shape: (num, n_node, n_dim). Unit: arb.
         """
         if self.dataset is None:
             # Lazily recreate the dataset object in the child process
@@ -321,19 +321,22 @@ class VocalizationDataset(Dataset):
         for each true location, a set of random locations are also returned.
 
         Args:
-            idx (int): _description_
+            idx (int): Index of the vocalization
 
         Returns:
             Audio (torch.Tensor): Audio sample for the index
             Locations (torch.Tensor): A (n_animals, n_samples, n_animals, n_nodes, n_dims) tensor of locations. Index `i`
                 along the first dimension indicates that animal index `i` (in dimension 2) is the true location from
-                that index and all other locations are random.
+                that index and all other locations are random. Unit: arb.
         """
 
         sound = self.__audio_for_index(idx)
         sound = self.__make_crop(sound, self.crop_length)
 
-        true_label = self.__label_for_index(idx)  # Shape: (n_animals, n_nodes, n_dims)
+        true_label = self.__label_for_index(
+            idx
+        )  # Shape: (n_animals, n_nodes, n_dims). Unit: dataset unit
+        true_label = self.scale_labels(true_label)  # Scale to arb. unit
         num_animals, n_nodes, n_dims = true_label.shape
         labels_with_rands = torch.empty(
             (
@@ -348,7 +351,7 @@ class VocalizationDataset(Dataset):
 
         for animal_idx in range(num_animals):
             true_loc = true_label[animal_idx, ...]  # Shape: (n_nodes, n_dims)
-            # Sample random locations for each animal
+            # Sample random locations for each animal. *important* Unit: Arb. unit
             random_labels = self.sample_rand_locations(
                 self.num_negative_samples * (num_animals - 1)
             ).reshape(self.num_negative_samples, num_animals - 1, n_nodes, n_dims)
@@ -365,10 +368,8 @@ class VocalizationDataset(Dataset):
                 :, animal_idx:, ...
             ]
 
-        sound, labels_with_rands = (
-            self.scale_audio(sound),
-            self.scale_labels(labels_with_rands),
-        )
+        sound = self.scale_audio(sound)
+        # Labels_with_rands is already in arb. unit. Doesn't need scaling
 
         return sound, labels_with_rands
 

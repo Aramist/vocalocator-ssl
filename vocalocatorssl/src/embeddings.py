@@ -4,8 +4,6 @@ import numpy as np
 import torch
 from torch import nn
 
-from .profiling import record
-
 
 class LocationEmbedding(nn.Module):
     def __init__(
@@ -94,7 +92,6 @@ class FourierEmbedding(LocationEmbedding):
     def init_weights(self) -> None:
         nn.init.normal_(self.rand_projection, mean=0, std=1 / self.bandwidth)
 
-    @record
     def forward(self, locations: torch.Tensor) -> torch.Tensor:
         """Generates a fixed-size embedding from a batch of location coordinates.
 
@@ -193,7 +190,6 @@ class MLPEmbedding(LocationEmbedding):
             ],
         )
 
-    @record
     def forward(self, locations: torch.Tensor) -> torch.Tensor:
         """Creates a fixed-size embedding from a batch of location coordinates.
 

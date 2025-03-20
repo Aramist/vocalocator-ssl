@@ -12,8 +12,6 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .profiling import record
-
 
 class Augmentation(nn.Module):
     def __init__(self, prob: float):
@@ -33,7 +31,6 @@ class Augmentation(nn.Module):
 
         self.prob = prob
 
-    @record
     def forward(self, audio: torch.Tensor) -> torch.Tensor:
         """Wraps the apply method with a dice roll. In eval mode, this is a no-op.
 

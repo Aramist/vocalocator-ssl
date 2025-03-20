@@ -2,6 +2,7 @@ import typing as tp
 from pathlib import Path
 
 from torch import nn, optim
+from torch.utils.data import DataLoader
 
 from .architectures import AudioEmbedder, ResnetConformer, SimpleNet, Wavenet
 from .augmentations import AugmentationConfig, build_augmentations
@@ -50,6 +51,7 @@ def get_default_config() -> dict:
             "nodes_to_load": ["Nose", "Head"],
             "batch_size": 128,
             "num_negative_samples": 1,
+            "num_inference_samples": 1000,
             # "min_difficulty": 300,
             # "max_difficulty": 30,
             # "sample_rate": 250000,
@@ -260,7 +262,7 @@ def initialize_location_embedding(config: dict) -> LocationEmbedding:
 
 def initialize_dataloaders(
     config: dict, dataset_path: Path, index_path: tp.Optional[Path]
-):
+) -> tuple[DataLoader, DataLoader, tp.Optional[DataLoader]]:
     """Initializes the training, validation, and (optionally) test dataloaders.
 
     Args:
@@ -294,9 +296,9 @@ def initialize_dataloaders(
     return train_dloader, val_dloader, test_dloader
 
 
-def initialize_inference_dataset(
+def initialize_inference_dataloader(
     config: dict, dataset_path: Path, index_path: tp.Optional[Path]
-) -> VocalizationDataset:
+) -> DataLoader:
     """Initializes the inference dataset
 
     Args:
@@ -306,11 +308,14 @@ def initialize_inference_dataset(
     dataset to use for inference. If none is provided, the entire dataset will be used.
     """
 
-    return build_inference_dataset(
+    dataloader = build_inference_dataset(
         dataset_path,
         index_path,
         arena_dims=config["dataloader"]["arena_dims"],
         crop_length=config["dataloader"]["crop_length"],
         normalize_data=config["dataloader"].get("normalize_data", True),
         node_names=config["dataloader"].get("nodes_to_load", None),
+        distribution_sample_size=config["dataloader"]["num_inference_samples"],
     )
+
+    return dataloader

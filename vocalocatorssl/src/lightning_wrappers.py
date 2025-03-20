@@ -1,3 +1,4 @@
+from sys import stderr
 from typing import Any
 
 import lightning as L
@@ -17,6 +18,7 @@ class LVocalocator(L.LightningModule):
 
         """
         super().__init__()
+        self.save_hyperparameters()
         self.config = config
 
         self.audio_encoder = utils.initialize_audio_embedder(config)
@@ -32,7 +34,7 @@ class LVocalocator(L.LightningModule):
 
         Args:
             audio (_type_): Audio (batch, time, channels)
-            labels (_type_): Labels (batch, 1+num_negative, mice, nodes, dims)
+            labels (_type_): Labels (batch, 1+num_negative, animals, nodes, dims)
             shuffle (bool, optional): Whether labels are shuffled. Defaults to True.
 
         Returns:
@@ -115,13 +117,39 @@ class LVocalocator(L.LightningModule):
         sound in the batch.
 
         Args:
-            batch (dict[str, torch.Tensor]): Batch of audio samples and candidate locations
+            batch (dict[str, torch.Tensor]): Batch of audio samples and candidate locations.
+                audio is expected to have shape (batch, time, channels)
+                locations are expected to have shape (batch, num_animals, num_samples, num_animals, num_nodes, num_dims)
 
         Returns:
             torch.Tensor: Score distributions for each candidate location (batch, num_animals, num_samples)
         """
+        audio = batch["audio"]
+        labels = batch["labels"]
+        if len(audio.shape) == 2:
+            audio = audio.unsqueeze(0)  # Create batch dim
+        if len(labels.shape) == 4:
+            labels = labels.unsqueeze(0)  # Create batch dim
         num_samples = self.config["inference"]["num_samples_per_vocalization"]
-        pass
+        if labels.shape[2] != num_samples:
+            print(
+                f"Expected {num_samples} samples, got {labels.shape[2]}. Might be an error...",
+                file=stderr,
+            )
+
+        audio_embeddings = self.audio_encoder(audio)  # (b, feats)
+        location_embeddings = self.location_encoder(
+            labels
+        )  # (b, n_animals, n_samples, d_embed)
+
+        audio_embeddings = audio_embeddings[:, None, None, :].expand(
+            *location_embeddings.shape[:-1],
+            -1,  # d_audio_embed not necessarily equal to d_loc_embed
+        )
+        scores = self.scorer(
+            audio_embeddings, location_embeddings
+        )  # (b, n_animals, n_samples)
+        return scores
 
     def configure_optimizers(self):
         """Configures the optimizer and learning rate scheduler. This is a bit complicated

@@ -37,7 +37,7 @@ def make_trainer(config: dict, save_directory: Path) -> L.Trainer:
                 verbose=False,
             ),
             # End training if validation accuracy does not improve for 10 epochs
-            callbacks.EarlyStopping(monitor="val_acc", mode="max", patience=10),
+            callbacks.EarlyStopping(monitor="val_acc", mode="max", patience=3),
         ],
         limit_predict_batches=1,
     )

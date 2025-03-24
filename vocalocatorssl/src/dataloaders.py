@@ -9,6 +9,7 @@ from typing import Optional, Tuple, Union
 import h5py
 import numpy as np
 import torch
+from scipy.stats.distributions import beta
 
 # from scipy.spatial import KDTree
 from torch.nn import functional as F
@@ -28,8 +29,8 @@ class VocalizationDataset(Dataset):
         index: Optional[np.ndarray] = None,
         normalize_data: bool = True,
         inference: bool = False,
-        # difficulty_range: Optional[tuple[float, float]] = None,
-        # num_difficulty_steps: int = 80_000,
+        difficulty_range: Optional[tuple[float, float]] = None,
+        num_difficulty_steps: int = 80_000,
     ):
         """
         Args:
@@ -68,12 +69,18 @@ class VocalizationDataset(Dataset):
         )
         self.normalize_data: bool = normalize_data
         self.inference: bool = inference
-        # self.difficulty_range: Optional[tuple[float, float]] = difficulty_range
-        # self.source_point_index: Optional[KDTree] = None
-        # self.num_difficulty_steps: int = num_difficulty_steps
-        # self.cur_difficulty_step: int = 0
         self.length: int = len(self.index)
         self.inverse_index = {v: k for k, v in enumerate(self.index)}
+
+        self.difficulty_range: Optional[tuple[float, float]] = difficulty_range
+        self.num_difficulty_steps: int = num_difficulty_steps
+        self.cur_difficulty_step: int = 0
+        # Array which stores the difficulty of each vocalization
+        self.vocalization_difficulties: Optional[np.ndarray] = None
+        # Map from indices in the sorted difficulty array to the indices in the dataset
+        self.difficulty_sorting: Optional[np.ndarray] = None
+        # Maps from indices in the dataset to indices in the difficulty sorting
+        self.inv_difficulty_sorting: Optional[np.ndarray] = None
 
         # Determine which nodes indices to select
         if nodes is None:
@@ -97,12 +104,16 @@ class VocalizationDataset(Dataset):
         seed = 0 if worker_info is None else worker_info.seed
         self.rng = np.random.default_rng(seed)
 
-        # if self.difficulty_range is not None:
-        #     source_points = dataset["locations"][..., self.node_indices[0], :]
-        #     if len(source_points.shape) == 3:
-        #         # flatten multi-animal dimension
-        #         source_points = source_points.reshape(-1, source_points.shape[-1])
-        #     self.source_point_index = KDTree(source_points)
+        if self.difficulty_range is not None:
+            # Expected shape: (dataset_size, n_animals, n_nodes, n_dims)
+            animal_configurations = dataset["locations"][:, :, self.node_indices[0], :]
+            animal_configurations = animal_configurations[self.index, ...]
+            self.vocalization_difficulties = self.__compute_difficulties(
+                animal_configurations
+            )
+            # Points with a low scalar value for `difficulty` are more difficult
+            self.difficulty_sorting = np.argsort(self.vocalization_difficulties)
+            self.inv_difficulty_sorting = np.argsort(self.difficulty_sorting)
 
         dataset.close()  # The dataset cannot be pickled by pytorch
 
@@ -145,6 +156,22 @@ class VocalizationDataset(Dataset):
             range_start = self.rng.integers(0, valid_range)
         range_end = range_start + crop_length
         return audio[range_start:range_end, :]
+
+    def sample_negative_location(self, idx: int) -> torch.Tensor:
+        """Samples a negative ground truth from the dataset. This is defined as a set of animal
+        positions from a different time point than the positive sample.
+
+        Args:
+            idx (int): True index of the positive sample in the dataset
+
+        Returns:
+            torch.Tensor: The negative sample. Shape: (n_animals, n_node, n_dim)
+        """
+        if self.difficulty_range is not None:
+            return self.sample_negatives_with_difficulty(idx)
+        choices = np.delete(self.index, self.inverse_index[idx])
+        neg_idx = self.rng.choice(choices)
+        return self.__label_for_index(neg_idx)
 
     def __audio_for_index(self, idx: int):
         """Gets an audio sample from the dataset. Will determine the format
@@ -212,61 +239,72 @@ class VocalizationDataset(Dataset):
         labels = labels[torch.arange(num), animal_choices, ...]
         return self.scale_labels(labels)  # Shape: (num, n_nodes, n_dims)
 
-    # TODO: Decide how to scale difficulty in multi-animal datasets
-    # @property
-    # def difficulty(self):
-    #     """Returns the current difficulty level, which is a value between 0 and 1."""
-    #     if self.difficulty_range is None:
-    #         return None
+    @property
+    def difficulty(self) -> Optional[float]:
+        """Returns the current difficulty level, which is a value between 0 and 1."""
+        if self.difficulty_range is None:
+            return None
 
-    #     return self.cur_difficulty_step / self.num_difficulty_steps
+        return self.cur_difficulty_step / self.num_difficulty_steps
 
-    # def step_difficulty(self):
-    #     self.cur_difficulty_step = min(
-    #         self.cur_difficulty_step + 1, self.num_difficulty_steps
-    #     )
+    def step_difficulty(self):
+        self.cur_difficulty_step = min(
+            self.cur_difficulty_step + 1, self.num_difficulty_steps
+        )
 
-    # def get_current_sample_difficulty(self):
-    #     """Returns the range about which negative samples are sampled based on the
-    #     current difficulty level.
-    #     """
-    #     if self.difficulty_range is None:
-    #         return None
+    def __compute_difficulties(self, animal_configurations: np.ndarray) -> np.ndarray:
+        """Computes the difficulty of a batch of animal positions based on the distance
+        between the animals. Lower values for difficulty indicate more difficult samples,
+        as the animals have less distance between them.
 
-    #     dist_min, dist_max = min(self.difficulty_range), max(self.difficulty_range)
+        Args:
+            animal_configurations (np.ndarray): Array of animal positions. Shape: (n_samples, n_animals, n_nodes, n_dims)
 
-    #     # At difficulty=1, the max distance should be dist_min
-    #     # At difficulty=0, the max distance should be dist_max
-    #     sample_dist = dist_max + (dist_min - dist_max) * self.difficulty
-    #     return sample_dist
+        Returns:
+            np.ndarray: Difficulties of shape (n_samples,)
+        """
 
-    # def sample_false_locations(self, positive_location: np.ndarray):
-    #     """Samples false locations for a batch of audio samples. False locations are
-    #     sampled uniformly from the dataset to match the distribution of true locations.
+        n_samples, n_animals, _, _ = animal_configurations.shape
+        animal_configurations = animal_configurations.reshape(n_samples, n_animals, -1)
+        # How spread out are the animals?
+        spread = animal_configurations.std(axis=1)  # Shape: (n_samples, n_dims)
+        # Combine dims. For the two-animal case I think this reduces to the euclidean distance
+        difficulty = np.linalg.norm(spread, axis=1)
+        return difficulty
 
-    #     Args: positive_location (np.ndarray): The true location for which false locations
-    #         are being sampled. Shape: (D,)
-    #     """
-    #     num_dims = int(len(positive_location) // len(self.node_indices))
-    #     num_samples = self.num_false_locations
-    #     sample_dist = self.get_current_sample_difficulty()
-    #     if sample_dist is None:
-    #         indices = np.arange(self.length)
-    #     else:
-    #         indices = self.source_point_index.query_ball_point(
-    #             positive_location[:num_dims], sample_dist
-    #         )[0]
+    def sample_negatives_with_difficulty(self, idx: int) -> torch.Tensor:
+        """Samples a negative frame from the dataset for index `idx` based on the
+        current difficulty level. This is done by computing a distribution over
+        the dataset based on each frame's difficulty and sampling from it to obtain
+        an index.
 
-    #     if len(indices) > num_samples:
-    #         samples = self.rng.choice(indices, num_samples, replace=False)
-    #     else:
-    #         _, samples = self.source_point_index.query(
-    #             positive_location[:num_dims], k=num_samples
-    #         )
-    #         samples = samples.squeeze()
+        Args:
+            idx (int): Current index. This function guarantees the sampled index will be distinct
 
-    #     return [self.__label_for_index(idx) for idx in samples]
-    # END TODO
+        Returns:
+            torch.Tensor: Animal poses for the negative frame. Shape: (n_animals, n_nodes, n_dims)
+        """
+        min_d, max_d = self.difficulty_range
+        cur_difficulty = (
+            self.difficulty * (max_d - min_d) + min_d
+        )  # float between min and max difficulty
+        beta = 10**cur_difficulty
+        alpha = (
+            1 / beta
+        )  # Smaller values of cur_difficulty yield samples of the beta distributino
+        # closer to zero, which corresponds to early (low spread) indices in the sorting
+        # index
+        sample = self.rng.beta(alpha, beta, 1).item()  # Sampled value between 0 and 1
+        # Like the input `idx`, this is a value between 0 and len(self)
+        # that is, an index into `self.index` rather than the underlying dataset
+        sampled_idx = int(
+            sample * (len(self) - 1)
+        )  # in clopen interval [0, len(self) )
+        # Ensure that `idx` isn't sampled
+        if sampled_idx == self.inv_difficulty_sorting[idx]:
+            sampled_idx += 1 if sampled_idx < len(self) - 1 else -1
+        # Map the sampled index back to the original dataset
+        idx_to_return = self.difficulty_sorting[sampled_idx]
 
     def scale_audio(
         self,

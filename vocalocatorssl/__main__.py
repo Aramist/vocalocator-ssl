@@ -73,10 +73,12 @@ def train_default(
     trainer = make_trainer(config, save_directory)
     trainer.fit(model, train_dloader, val_dloader)
 
-    # Get the best checkpoint path
-    best_ckpt = trainer.checkpoint_callback.best_model_path
-    # Symlink to save_directory
-    os.symlink(best_ckpt, save_directory / "best.ckpt")
+    if trainer.global_rank == 0:
+        # Get the best checkpoint path
+        best_ckpt = trainer.checkpoint_callback.best_model_path
+        best_ckpt = os.path.relpath(best_ckpt, start=save_directory)
+        # Symlink to save_directory
+        os.symlink(best_ckpt, save_directory / "best.ckpt")
 
 
 def inference(

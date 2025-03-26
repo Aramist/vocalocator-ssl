@@ -313,9 +313,9 @@ def initialize_inference_dataloader(
         index_path,
         arena_dims=config["dataloader"]["arena_dims"],
         crop_length=config["dataloader"]["crop_length"],
+        batch_size=config["dataloader"]["batch_size"],
         normalize_data=config["dataloader"].get("normalize_data", True),
         node_names=config["dataloader"].get("nodes_to_load", None),
-        distribution_sample_size=config["dataloader"]["num_inference_samples"],
     )
 
     return dataloader

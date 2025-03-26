@@ -165,6 +165,10 @@ class VocalizationDataset(Dataset):
         """
 
         locs = self.dataset["locations"][idx, ..., self.node_indices, :]
+        # either (n_animals, n_nodes, n_dims) if len(locs.shape) == 3
+        # or (n_nodes, n_dims)
+        if len(locs.shape) == 2:
+            locs = locs[None, ...]
         locs = torch.from_numpy(locs.astype(np.float32))
         return locs
 
@@ -529,7 +533,7 @@ def build_inference_dataset(
     crop_length: int,
     normalize_data: bool,
     node_names: list[str],
-    distribution_sample_size: int,
+    batch_size: int,
 ) -> DataLoader:
     """Constructs a single dataset for performing inference on a dataset.
 
@@ -556,16 +560,16 @@ def build_inference_dataset(
         arena_dims=arena_dims,
         crop_length=crop_length,
         crop_randomly=True,  # Todo: Experiment with this
-        inference=True,
+        inference=False,
         index=indices,
         normalize_data=normalize_data,
         nodes=node_names,
-        num_negative_samples=distribution_sample_size,
+        num_negative_samples=0,
     )
 
     loader = DataLoader(
         inference_dataset,
-        batch_size=1,
+        batch_size=batch_size,
         num_workers=get_logical_cores(),
         shuffle=False,
         collate_fn=inference_dataset.collate,

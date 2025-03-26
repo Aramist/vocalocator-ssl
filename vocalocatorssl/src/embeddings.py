@@ -76,11 +76,7 @@ class FourierEmbedding(LocationEmbedding):
         self.bandwidth = init_bandwidth
         self.location_combine_mode = location_combine_mode
 
-        d_input = (
-            d_location * n_expected_locations
-            if location_combine_mode == "concat"
-            else d_location
-        )
+        d_input = d_location
         self.rand_projection = nn.Parameter(
             torch.zeros(d_input, d_embedding // 2), requires_grad=True
         )
@@ -104,28 +100,12 @@ class FourierEmbedding(LocationEmbedding):
         Returns:
             torch.Tensor: (*batch, d_embedding) tensor of embeddings
         """
-        if self.location_combine_mode == "concat":
-            # flatten the num_locations, num_nodes, and num_dims into one
-            if locations.shape[-2] != self.num_locations:
-                raise ValueError(
-                    f"Expected {self.num_locations} locations, got {locations.shape[-2]}"
-                )
-            # Shuffle the locations to avoid overfitting to the order
-            perm = self.rng.permutation(self.num_locations)
-            locations = locations[:, perm]
-            locations = locations.view(*locations.shape[:-3], -1)
-            # resulting shape: (*batch, d_location * num_locations)
-        else:
-            # flatten the num_nodes and num_dims into one
-            locations = locations.view(*locations.shape[:-2], -1)
-            # resulting shape: (*batch, num_locations, d_location)
+        # flatten the num_nodes and num_dims into one
+        locations = locations.view(*locations.shape[:-2], -1)
+        # resulting shape: (*batch, num_animals, num_locations, d_location)
 
         mapping = torch.einsum("...m,md->...d", locations, self.rand_projection)
-        # if concat: shape is (*batch, d_embed)
-        # if add: shape is (*batch, num_locations, d_embed)
-        if self.location_combine_mode == "add":
-            # Honestly not sure if it makes more sense for this to come before or after the sincos
-            mapping = mapping.mean(dim=-2)
+        # shape is (*batch, num_locations, d_embed)
 
         return torch.cat([torch.cos(mapping), torch.sin(mapping)], dim=-1) / np.sqrt(
             self.d_embedding
@@ -175,11 +155,7 @@ class MLPEmbedding(LocationEmbedding):
         self.location_combine_mode = location_combine_mode
 
         # Calculate input dimensionality
-        input_dim = (
-            d_location * n_expected_locations
-            if location_combine_mode == "concat"
-            else d_location
-        )
+        input_dim = d_location
 
         # Create MLP
         channel_sizes = [input_dim] + [hidden_dim] * n_hidden + [d_embedding]
@@ -199,17 +175,10 @@ class MLPEmbedding(LocationEmbedding):
         Returns:
             torch.Tensor: (*batch, d_embedding) tensor of embeddings
         """
-        if self.location_combine_mode == "concat":
-            # flatten the num_locations, num_nodes, and num_dims into one
-            locations = locations.view(*locations.shape[:-3], -1)
-        else:
-            # flatten the num_nodes and num_dims into one
-            locations = locations.view(*locations.shape[:-2], -1)
+        # flatten the num_nodes and num_dims into one
+        locations = locations.view(*locations.shape[:-2], -1)
 
         embed = self.dense(locations)
-        # if concat: shape is (*batch, d_embed)
-        # if add: shape is (*batch, num_locations, d_embed)
+        # shape is (*batch, num_locations, d_embed)
 
-        if self.location_combine_mode == "add":
-            embed = embed.sum(dim=-2)
         return embed

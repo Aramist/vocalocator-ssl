@@ -39,6 +39,7 @@ def make_trainer(config: dict, save_directory: Path) -> L.Trainer:
             # End training if validation accuracy does not improve for 10 epochs
             callbacks.EarlyStopping(monitor="val_acc", mode="max", patience=10),
         ],
+        limit_predict_batches=1,
     )
 
 
@@ -119,11 +120,19 @@ def inference(
         model.config, data_path, index_file
     )
 
-    # Limit batches for debugging
     trainer = make_trainer(config, save_directory)
-    preds = trainer.predict(model, dloader, ckpt_path=newest_checkpoint)
-    scores = torch.cat(preds, dim=0).cpu().numpy()
-    np.save(output_path, scores)
+    preds: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = trainer.predict(
+        model, dloader, ckpt_path=newest_checkpoint, return_predictions=True
+    )
+
+    labels = [x[0] for x in preds]
+    grid = [x[1] for x in preds]
+    scores = [x[2] for x in preds]
+
+    labels = torch.cat(labels, dim=0).cpu().numpy()
+    grid = torch.cat(grid, dim=0).cpu().numpy()
+    scores = torch.cat(scores, dim=0).cpu().numpy()
+    np.savez(output_path, labels=labels, grid=grid, scores=scores)
 
 
 if __name__ == "__main__":

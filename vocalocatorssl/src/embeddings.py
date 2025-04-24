@@ -10,16 +10,27 @@ class LocationEmbedding(nn.Module):
         self,
         d_location: int,
         d_embedding: int,
-        n_expected_locations: int,
+        multinode_strategy: Literal["absolute", "relative"] = "absolute",
     ):
         """An abstract class for modules that convert one or more spatial coordinates
         into a fixed-size embedding.
+
+        Args:
+            d_location (int): Dimensionality of the location coordinates
+            d_embedding (int): Dimensionality of the output embedding
+            multinode_strategy (Literal["absolute", "relative"], optional): How to handle multiple nodes. Defaults to "absolute".
+                - "absolute": Each node is treated independently.
+                - "relative": All nodes except the first are made relative to the first node.
         """
         super().__init__()
 
         self.d_location = d_location
         self.d_embedding = d_embedding
-        self.num_locations = n_expected_locations
+        self.multinode_strategy = multinode_strategy
+        if multinode_strategy not in ["absolute", "relative"]:
+            raise ValueError(
+                f"multinode_strategy must be 'absolute' or 'relative', got {multinode_strategy}"
+            )
 
     def forward(self, locations: torch.Tensor) -> torch.Tensor:
         """Generates a fixed-size embedding from a batch of location coordinates.
@@ -41,10 +52,9 @@ class FourierEmbedding(LocationEmbedding):
         self,
         d_location: int,
         d_embedding: int,
-        n_expected_locations: int,
         *,
         init_bandwidth: float = 1,
-        location_combine_mode: Literal["concat", "add"] = "concat",
+        multinode_strategy: Literal["absolute", "relative"] = "absolute",
         **kwargs,  # Don't crash if we get extra kwargs
     ):
         """Creates a learned positional embedding based on Fourier Features.
@@ -53,8 +63,10 @@ class FourierEmbedding(LocationEmbedding):
         Args:
             d_location (int): Dimensionality of the location coordinates
             d_embedding (int): Dimensionality of the embedding
-            n_expected_locations (int): Number of locations included in each embedding
             init_bandwidth (float, optional): Bandwidth of the random projection's initial weights. Defaults to 1.
+            multinode_strategy (Literal["absolute", "relative"], optional): How to handle multiple nodes. Defaults to "absolute".
+                - "absolute": Each node is treated independently.
+                - "relative": All nodes except the first are made relative to the first node.
 
         Raises:
             ValueError: If d_embedding is not even
@@ -62,26 +74,19 @@ class FourierEmbedding(LocationEmbedding):
             ValueError: If init_bandwidth is non-positive
         """
         super(FourierEmbedding, self).__init__(
-            d_location, d_embedding, n_expected_locations
+            d_location, d_embedding, multinode_strategy
         )
         if d_embedding % 2 != 0:
             raise ValueError(f"d_embedding must be even, got {d_embedding}")
-        if location_combine_mode not in ["concat", "add"]:
-            raise ValueError(
-                f"location_combine_mode must be 'concat' or 'add', got {location_combine_mode}"
-            )
         if init_bandwidth <= 0:
             raise ValueError(f"init_bandwidth must be positive, got {init_bandwidth}")
 
         self.bandwidth = init_bandwidth
-        self.location_combine_mode = location_combine_mode
 
         d_input = d_location
         self.rand_projection = nn.Parameter(
             torch.zeros(d_input, d_embedding // 2), requires_grad=True
         )
-
-        self.rng = np.random.default_rng()
 
         self.init_weights()
 
@@ -100,6 +105,13 @@ class FourierEmbedding(LocationEmbedding):
         Returns:
             torch.Tensor: (*batch, d_embedding) tensor of embeddings
         """
+        if self.multinode_strategy == "relative":
+            # Make all nodes except the first node relative to the first
+            locations[..., 1:, :] -= locations[..., :1, :]
+            locations[..., 1:, :] /= torch.linalg.norm(
+                locations[..., 1:, :], dim=-1, keepdim=True
+            )
+
         # flatten the num_nodes and num_dims into one
         locations = locations.view(*locations.shape[:-2], -1)
         # resulting shape: (*batch, num_animals, num_locations, d_location)
@@ -117,11 +129,10 @@ class MLPEmbedding(LocationEmbedding):
         self,
         d_location: int,
         d_embedding: int,
-        n_expected_locations: int,
         *,
         n_hidden: int = 1,
         hidden_dim: int = 512,
-        location_combine_mode: Literal["concat", "add"] = "concat",
+        multinode_strategy: Literal["absolute", "relative"] = "absolute",
         **kwargs,  # Don't crash if we get extra kwargs
     ):
         """Creates a simple MLP for transforming 3d locations into a fixed-size embedding.
@@ -132,27 +143,22 @@ class MLPEmbedding(LocationEmbedding):
             n_expected_locations (int): Number of locations embedded together
             n_hidden (int, optional): Number of hidden layers in the MLP. Defaults to 1.
             hidden_dim (int, optional): Dimensionality of the hidden layers. Defaults to 512.
-            location_combine_mode (Literal[&quot;concat&quot;, &quot;add&quot;], optional): How the locations are combined into the embedding
+            multinode_strategy (Literal["absolute", "relative"], optional): How to handle multiple nodes. Defaults to "absolute".
+                - "absolute": Each node is treated independently.
+                - "relative": All nodes except the first are made relative to the first node.
 
         Raises:
             ValueError: If d_embedding is not even
             ValueError: If location_combine_mode is not 'concat' or 'add'
         """
-        super(MLPEmbedding, self).__init__(
-            d_location, d_embedding, n_expected_locations
-        )
+        super(MLPEmbedding, self).__init__(d_location, d_embedding, multinode_strategy)
 
         # Check inputs
         if d_embedding % 2 != 0:
             raise ValueError(f"d_embedding must be even, got {d_embedding}")
-        if location_combine_mode not in ["concat", "add"]:
-            raise ValueError(
-                f"location_combine_mode must be 'concat' or 'add', got {location_combine_mode}"
-            )
 
         self.hidden_dim = hidden_dim
         self.n_layers = n_hidden
-        self.location_combine_mode = location_combine_mode
 
         # Calculate input dimensionality
         input_dim = d_location
@@ -175,6 +181,13 @@ class MLPEmbedding(LocationEmbedding):
         Returns:
             torch.Tensor: (*batch, d_embedding) tensor of embeddings
         """
+        if self.multinode_strategy == "relative":
+            # Make all nodes except the first node relative to the first
+            locations[..., 1:, :] -= locations[..., :1, :]
+            locations[..., 1:, :] /= torch.linalg.norm(
+                locations[..., 1:, :], dim=-1, keepdim=True
+            )
+
         # flatten the num_nodes and num_dims into one
         locations = locations.view(*locations.shape[:-2], -1)
 

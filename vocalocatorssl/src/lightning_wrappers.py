@@ -1,13 +1,22 @@
-from sys import stderr
 from typing import Any
 
 import lightning as L
 import numpy as np
 import torch
-from torch import nn, optim
+from torch import optim
 from torchmetrics.classification import MulticlassAccuracy
 
 from . import utils
+
+
+def info_nce(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    temperature: float = 1.0,
+):
+    return torch.logsumexp(logits / temperature, dim=1).mean(dim=0) - logits.gather(
+        dim=1, index=labels.unsqueeze(1)
+    ).mean(dim=0)
 
 
 class LVocalocator(L.LightningModule):
@@ -26,7 +35,7 @@ class LVocalocator(L.LightningModule):
         self.location_encoder = utils.initialize_location_embedding(config)
         self.scorer = utils.initialize_scorer(config)
         self.augmentation_transform = utils.initialize_augmentations(config)
-        self.loss_fn = nn.CrossEntropyLoss()
+        self.loss_fn = info_nce
 
     def forward(
         self, audio, labels, shuffle: bool = True
@@ -91,7 +100,7 @@ class LVocalocator(L.LightningModule):
         scores, positive_label_index = self.forward(audio, labels)
         loss = self.loss_fn(scores, positive_label_index)
 
-        self.log("train_loss", loss)
+        self.log("train_loss", loss, on_epoch=True)
         return loss
 
     def validation_step(
@@ -116,12 +125,12 @@ class LVocalocator(L.LightningModule):
         )
         acc = metric(scores, positive_label_index)
 
-        self.log("val_acc", acc, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("val_acc", acc, on_epoch=True, sync_dist=True)
         return acc
 
     def predict_step(
         self, batch: dict[str, torch.Tensor], *args: Any
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Computes score distributions for each candidate source location for each
         sound in the batch.
 
@@ -148,57 +157,74 @@ class LVocalocator(L.LightningModule):
         labels = labels.squeeze(1)  # num_negative exepcted to be 0
         labels = labels[:, 0, :, :]  # (b, n_nodes, n_dims)
 
-        head_to_nose = labels[:, 0, :] - labels[:, 1, :]
+        head_to_nose = labels[:, 0, :] - labels[:, 1, :]  # (b, 3)
+        # Expand to multiple orientations
+        # We will consider shifting the orientation 15, 30, 45 in either direction
+        num_angles = 120
+        angle_diffs_np = np.deg2rad(np.linspace(0, 360, num_angles, endpoint=False))
+        angle_diffs = torch.from_numpy(angle_diffs_np).float().to(labels.device)
+
+        h_t_n_xy_angle = torch.arctan2(head_to_nose[:, 1], head_to_nose[:, 0])  # (b, )
+        h_t_n_xy_mag = torch.linalg.norm(head_to_nose[:, :2], dim=-1)  # (b, )
+        new_h_t_n_xy_angle = (
+            h_t_n_xy_angle[:, None] + angle_diffs[None, :]
+        )  # (b, n_angle)
+        new_h_t_n = torch.stack(
+            [
+                h_t_n_xy_mag[:, None] * torch.cos(new_h_t_n_xy_angle),  # (b, n_angle)
+                h_t_n_xy_mag[:, None] * torch.sin(new_h_t_n_xy_angle),  # (b, n_angle)
+                head_to_nose[:, 2]
+                .unsqueeze(1)
+                .expand(-1, angle_diffs.shape[0]),  # (b, n_angle)
+            ],
+            dim=-1,
+        )  # (b, n_angle, 3)
 
         grid = np.stack(
             np.meshgrid(
                 np.linspace(-1, 1, 100),  # x
                 np.linspace(-1, 1, 100),  # y
-                np.linspace(0.05, 0.15, 3),  # z
+                np.linspace(0.05, 0.05, 1),  # z
             ),
             axis=-1,
-        )  # (n_z, n_y, n_x, 3)
+        ).squeeze()  # (n_y, n_x, 3)
         grid_head = (
             torch.from_numpy(grid).float().to(labels.device)
         )  # (n_z, n_y, n_x, 3)
-        grid_head = grid_head.reshape(-1, 3)  # (n_grid, 3)
+        grid_head = grid_head.reshape(1, 1, -1, 3)  # (1 (b), 1(n_angle), n_grid, 3)
         # create nose points
-        grid_nose = grid_head[None, ...] + head_to_nose[:, None, :]  # (b, n_grid, 3)
-        grid_head = grid_head[None, ...].expand_as(grid_nose)  # (b, n_grid, 3)
-        grid = torch.stack([grid_head, grid_nose], dim=2)  # (b, n_grid, 2, 3)
+        grid_nose = grid_head + new_h_t_n[:, :, None, :]  # (b, n_angle, n_grid, 3)
+        grid_head = grid_head.expand_as(grid_nose)  # (b, n_grid, 3)
+        grid = torch.stack([grid_nose, grid_head], dim=-2)  # (b, n_angle, n_grid, 2, 3)
 
         audio_embeddings = self.audio_encoder(audio)  # (b, feats)
-        location_embeddings = self.location_encoder(grid)  # (b, n_grid, d_embed)
+        location_embeddings = self.location_encoder(
+            grid
+        )  # (b, n_angle, n_grid, d_embed)
 
-        audio_embeddings = audio_embeddings[:, None, :].expand(
+        audio_embeddings = audio_embeddings[:, None, None, :].expand(
             *location_embeddings.shape[:-1],
             -1,  # d_audio_embed not necessarily equal to d_loc_embed
         )
-        scores = self.scorer(audio_embeddings, location_embeddings)  # (b, n_grid)
-        return labels, grid, scores
+        scores = self.scorer(
+            audio_embeddings, location_embeddings
+        )  # (b, n_angle, n_grid)
+        return labels, scores
 
     def configure_optimizers(self):
-        """Configures the optimizer and learning rate scheduler. This is a bit complicated
-        becasue I want to use a cosine decay schedule with a warmup period.
-        """
-        total_steps = self.config["optimization"]["num_weight_updates"]
-        warmup_steps = self.config["optimization"]["num_warmup_steps"]
+        """Configures the optimizer and learning rate scheduler for a simple reduce-on-plateau
+        setup."""
         optimizer = utils.initialize_optimizer(self.config, self.parameters())
-        warmup_sched = optim.lr_scheduler.LinearLR(optimizer, total_iters=warmup_steps)
-        cosine_sched = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=total_steps - warmup_steps
-        )
-        chained_sched = optim.lr_scheduler.SequentialLR(
-            optimizer,
-            schedulers=[warmup_sched, cosine_sched],
-            milestones=[warmup_steps],
+        sched = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer=optimizer, patience=10, factor=0.1, mode="min"
         )
 
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
-                "scheduler": chained_sched,
-                "interval": "step",  # Call at every step, rather than epoch
+                "scheduler": sched,
+                "interval": "epoch",
                 "frequency": 1,
+                "monitor": "train_loss",
             },
         }

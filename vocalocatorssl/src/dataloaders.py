@@ -247,7 +247,7 @@ class VocalizationDataset(Dataset):
         if len(points_in_radius) < self.num_negative_samples:
             # get more entropy by sampling nearest neighbors
             _, points_in_radius = self.search_tree.query(
-                search_center.numpy(), k=num_negative_samples * 2
+                search_center.numpy(), k=self.num_negative_samples * 2
             )
             points_in_radius = points_in_radius[1:]  # Exclude the point itself
 

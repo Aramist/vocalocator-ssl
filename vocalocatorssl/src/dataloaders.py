@@ -244,9 +244,11 @@ class VocalizationDataset(Dataset):
         points_in_radius = self.search_tree.query_ball_point(
             search_center.numpy(), search_radius
         )
-        if len(points_in_radius) < 30:
+        if len(points_in_radius) < self.num_negative_samples:
             # get more entropy by sampling nearest neighbors
-            _, points_in_radius = self.search_tree.query(search_center.numpy(), k=30)
+            _, points_in_radius = self.search_tree.query(
+                search_center.numpy(), k=num_negative_samples * 2
+            )
             points_in_radius = points_in_radius[1:]  # Exclude the point itself
 
         # Sample a random point from the points in the radius

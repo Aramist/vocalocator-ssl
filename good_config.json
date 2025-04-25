@@ -1,0 +1,59 @@
+{
+    "optimization": {
+        "num_weight_updates": 100000,
+        "weight_updates_per_epoch": 1000,
+        "num_warmup_steps": 1000,
+        "optimizer": "sgd",
+        "momentum": 0.8,
+        "weight_decay": 0,
+        "clip_gradients": true,
+        "initial_learning_rate": 1e-2
+    },
+    "architecture": "simplenet",
+    "model_params": {
+        "d_embedding": 128,
+        "num_channels": 24
+    },
+    "location_embedding_type": "fourier",
+    "location_embedding_params": {
+        "d_embedding": 128,
+        "init_bandwidth": 0.35,
+        "multinode_strategy": "absolute"
+    },
+    "score_function_type": "cosinesim",
+    "score_function_params": {
+        "d_hidden": 512
+    },
+    "dataloader": {
+        "num_microphones": 24,
+        "crop_length": 4096,
+        "arena_dims": [
+            615,
+            615,
+            425
+        ],
+        "arena_dims_units": "mm",
+        "normalize_data": true,
+        "nodes_to_load": [
+            "Nose",
+            "Head"
+        ],
+        "num_negative_samples": 90,
+        "num_val_negative_samples": 19,
+        "min_difficulty": -1,
+        "max_difficulty": 1,
+        "num_difficulty_steps": 2500
+    },
+    "augmentations": {
+        "should_use_augmentations": true,
+        "mask_temporal_prob": 0.5,
+        "mask_temporal_min_length": 915,
+        "mask_temporal_max_length": 3953,
+        "mask_channels_prob": 0.25,
+        "mask_channels_min_channels": 3,
+        "mask_channels_max_channels": 6,
+        "noise_injection_prob": 0.5,
+        "noise_injection_snr_min": 3.530698061861244,
+        "noise_injection_snr_max": 14.817122459314996
+    }
+}

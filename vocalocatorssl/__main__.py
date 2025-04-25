@@ -14,7 +14,7 @@ from .src.lightning_wrappers import LVocalocator
 from .src.utils import load_json
 
 
-def make_trainer(config: dict, save_directory: Path) -> L.Trainer:
+def make_trainer(config: dict, save_directory: Path, **kwargs) -> L.Trainer:
     num_nodes = int(os.getenv("SLURM_NNODES", 1))
     return L.Trainer(
         max_steps=config["optimization"]["num_weight_updates"],
@@ -40,6 +40,7 @@ def make_trainer(config: dict, save_directory: Path) -> L.Trainer:
             callbacks.LearningRateMonitor(logging_interval="epoch"),
         ],
         gradient_clip_val=1.0 if config["optimization"]["clip_gradients"] else None,
+        **kwargs,
     )
 
 
@@ -125,7 +126,9 @@ def inference(
         model.config, data_path, index_file
     )
 
-    trainer = make_trainer(config, save_directory)
+    trainer = make_trainer(
+        config, save_directory, logger=False, limit_predict_batches=4096
+    )
     preds: tp.Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = (
         trainer.predict(
             model, dloader, ckpt_path=newest_checkpoint, return_predictions=True

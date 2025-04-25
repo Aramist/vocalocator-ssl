@@ -604,7 +604,7 @@ def build_inference_dataset(
         index=indices,
         normalize_data=normalize_data,
         nodes=node_names,
-        num_negative_samples=0,
+        num_negative_samples=200,
     )
 
     loader = DataLoader(

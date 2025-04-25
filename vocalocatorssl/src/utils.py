@@ -1,12 +1,13 @@
 import typing as tp
 from pathlib import Path
 
+import pyjson5
 from torch import nn, optim
 from torch.utils.data import DataLoader
 
 from .architectures import AudioEmbedder, ResnetConformer, SimpleNet, Wavenet
 from .augmentations import AugmentationConfig, build_augmentations
-from .dataloaders import VocalizationDataset, build_dataloaders, build_inference_dataset
+from .dataloaders import build_dataloaders, build_inference_dataset
 from .embeddings import FourierEmbedding, LocationEmbedding, MLPEmbedding
 from .scorers import CosineSimilarityScorer, MLPScorer, Scorer
 
@@ -32,16 +33,13 @@ def get_default_config() -> dict:
         # Valid location embedding types: fourier, mlp
         "location_embedding_type": "fourier",
         "location_embedding_params": {
-            "n_expected_locations": 2,  # dyad by default
             "d_embedding": 128,
             "init_bandwidth": 0.1,
-            "location_combine_mode": "concat",
+            "multinode_strategy": "absolute",
         },
         # Valid scorers: cosinesim, mlp
         "score_function_type": "cosinesim",
         "score_function_params": {},
-        # Valid loss functions: crossentropy
-        "loss_function": "crossentropy",
         "dataloader": {
             "num_microphones": 24,
             "crop_length": 8192,
@@ -51,10 +49,9 @@ def get_default_config() -> dict:
             "nodes_to_load": ["Nose", "Head"],
             "batch_size": 128,
             "num_negative_samples": 1,
-            "num_inference_samples": 1000,
-            # "min_difficulty": 300,
-            # "max_difficulty": 30,
-            # "sample_rate": 250000,
+            "min_difficulty": -1,
+            "max_difficulty": 1,
+            "num_difficulty_steps": 1000,
         },
         "augmentations": {
             "should_use_augmentations": True,
@@ -73,6 +70,12 @@ def get_default_config() -> dict:
         },
     }
     return DEFAULT_CONFIG
+
+
+def load_json(path: Path) -> dict:
+    with open(path, "rb") as ctx:
+        data = pyjson5.load(ctx)
+    return data
 
 
 def update_recursively(dictionary: dict, defaults: dict) -> dict:
@@ -261,7 +264,10 @@ def initialize_location_embedding(config: dict) -> LocationEmbedding:
 
 
 def initialize_dataloaders(
-    config: dict, dataset_path: Path, index_path: tp.Optional[Path]
+    config: dict,
+    dataset_path: Path,
+    index_path: tp.Optional[Path],
+    rank: int = 0,
 ) -> tuple[DataLoader, DataLoader, tp.Optional[DataLoader]]:
     """Initializes the training, validation, and (optionally) test dataloaders.
 
@@ -271,6 +277,9 @@ def initialize_dataloaders(
         index_path (tp.Optional[Path]): Path to a directory containing numpy files describing
     the test-train split of the dataset. If none is provided, a split will be automatically
     generated.
+        global_rank (int, optional): Global rank of the process. Defaults to 0. Used to seed
+    the dataset sampler to avoid redundant data loading across multiple processes.
+    This is only relevant for distributed training.
 
     Raises:
         FileNotFoundError: If the dataset file is not found
@@ -288,9 +297,16 @@ def initialize_dataloaders(
         arena_dims=config["dataloader"]["arena_dims"],
         batch_size=config["dataloader"]["batch_size"],
         crop_length=config["dataloader"]["crop_length"],
-        normalize_data=config["dataloader"].get("normalize_data", True),
-        node_names=config["dataloader"].get("nodes_to_load", None),
-        num_negative_samples=config["dataloader"].get("num_negative_samples", 1),
+        normalize_data=config["dataloader"]["normalize_data"],
+        node_names=config["dataloader"]["nodes_to_load"],
+        num_negative_samples=config["dataloader"]["num_negative_samples"],
+        num_difficulty_steps=config["dataloader"]["num_difficulty_steps"],
+        min_difficulty=config["dataloader"]["min_difficulty"],
+        max_difficulty=config["dataloader"]["max_difficulty"],
+        sampler_seed=rank,
+        num_val_negative_samples=config["dataloader"].get(
+            "num_val_negative_samples", None
+        ),
     )
 
     return train_dloader, val_dloader, test_dloader
@@ -313,9 +329,9 @@ def initialize_inference_dataloader(
         index_path,
         arena_dims=config["dataloader"]["arena_dims"],
         crop_length=config["dataloader"]["crop_length"],
+        batch_size=1,
         normalize_data=config["dataloader"].get("normalize_data", True),
         node_names=config["dataloader"].get("nodes_to_load", None),
-        distribution_sample_size=config["dataloader"]["num_inference_samples"],
     )
 
     return dataloader

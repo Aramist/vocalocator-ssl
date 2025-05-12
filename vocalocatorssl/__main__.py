@@ -14,6 +14,22 @@ from .src.lightning_wrappers import LVocalocator
 from .src.utils import load_json
 
 
+def find_latest_checkpoint(save_directory: Path) -> Path:
+    """Find the latest checkpoint in the given directory.
+
+    Args:
+        save_directory (Path): Path to the directory containing checkpoints.
+
+    Returns:
+        Path: Path to the latest checkpoint file.
+    """
+    checkpoints = list(save_directory.glob("**/*.ckpt"))
+    if not checkpoints:
+        raise FileNotFoundError(f"No checkpoints found at {save_directory}")
+    newest_checkpoint = max(checkpoints, key=os.path.getctime)
+    return newest_checkpoint
+
+
 def make_trainer(config: dict, save_directory: Path, **kwargs) -> L.Trainer:
     num_nodes = int(os.getenv("SLURM_NNODES", 1))
     return L.Trainer(
@@ -36,10 +52,21 @@ def make_trainer(config: dict, save_directory: Path, **kwargs) -> L.Trainer:
             callbacks.EarlyStopping(
                 monitor="train_loss", check_finite=True, verbose=False, patience=1000
             ),
+            # End training if learning rate gets too low
+            # callbacks.EarlyStopping(
+            #     monitor="lr-SGD",
+            #     mode="min",
+            #     patience=100000000,
+            #     stopping_threshold=1e-6,
+            # ),
             # Log learning rates
             callbacks.LearningRateMonitor(logging_interval="epoch"),
         ],
         gradient_clip_val=1.0 if config["optimization"]["clip_gradients"] else None,
+        # limit_train_batches=10,
+        # limit_val_batches=1,
+        # max_epochs=1,
+        # profiler="advanced",
         **kwargs,
     )
 
@@ -49,6 +76,7 @@ def train_default(
     data_path: Path,
     save_directory: Path,
     index_dir: tp.Optional[Path] = None,
+    pretrained_path: tp.Optional[Path] = None,
 ):
     save_directory.mkdir(exist_ok=True, parents=True)
 
@@ -73,7 +101,16 @@ def train_default(
         with open(save_directory / "config.json", "w") as ctx:
             json.dump(config, ctx, indent=4)
 
-    model = LVocalocator(config)
+    if pretrained_path is not None:
+        pretrained_ckpt = find_latest_checkpoint(pretrained_path)
+        print("Loading pretrained model from", pretrained_ckpt)
+        # The finetuned model may have a different config, loading the checkpoint without explicitly
+        # passing the new config will use the old config from the pretrained model
+        model = LVocalocator.load_from_checkpoint(
+            pretrained_ckpt, is_finetuning=True, config=config
+        )
+    else:
+        model = LVocalocator(config)
     trainer.fit(model, train_dloader, val_dloader)
 
     if trainer.global_rank == 0:
@@ -91,8 +128,10 @@ def train_default(
 def inference(
     data_path: Path,
     save_directory: Path,
+    *,
+    output_path: Path,
     index_file: tp.Optional[Path] = None,
-    output_path: tp.Optional[Path] = None,
+    test_mode: bool = False,
 ):
     """Runs inference on a dataset using the trained model located at `save_directory`.
 
@@ -101,7 +140,9 @@ def inference(
         data_path (Path): Path to the dataset.
         save_directory (Path): Path to the directory containing the trained model.
         index_file (tp.Optional[Path], optional): Path ta a numpy array containing indices to process. Defaults to None.
-        output_path (tp.Optional[Path], optional): Path to save the predictions. Defaults to predictions.npy.
+        output_path (Path): Path to save the predictions.
+        test_mode (bool, optional): If False, the model will be used for predicting sound sources. If true
+            the model's accuracy at varying distances will be tested on the provided dataset.
 
     Raises:
         FileNotFoundError: If the model is not found at `save_directory`.
@@ -110,28 +151,26 @@ def inference(
     """
     if not save_directory.exists():
         raise FileNotFoundError(f"Model not found at {save_directory}")
-    if output_path is None:
-        output_path = save_directory / "predictions.npz"
 
     config_path = save_directory / "config.json"
     config = load_json(config_path)
 
-    checkpoints = list(save_directory.glob("**/*.ckpt"))
-    if not checkpoints:
-        raise FileNotFoundError(f"No checkpoints found at {save_directory}")
-    newest_checkpoint = max(checkpoints, key=os.path.getctime)
+    newest_checkpoint = find_latest_checkpoint(save_directory)
 
-    model = LVocalocator.load_from_checkpoint(newest_checkpoint)
+    model = LVocalocator.load_from_checkpoint(
+        newest_checkpoint, strict=False, config=config
+    )
     dloader = utilsmodule.initialize_inference_dataloader(
-        model.config, data_path, index_file
+        model.config, data_path, index_file, test_mode=test_mode
     )
 
-    trainer = make_trainer(
-        config, save_directory, logger=False, limit_predict_batches=4096
-    )
+    trainer = make_trainer(config, save_directory, logger=False)
     preds: tp.Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = (
         trainer.predict(
-            model, dloader, ckpt_path=newest_checkpoint, return_predictions=True
+            model,
+            dloader,
+            return_predictions=True,
+            ckpt_path=newest_checkpoint,  # probably unnecessary
         )
     )
 
@@ -148,8 +187,11 @@ if __name__ == "__main__":
     ap.add_argument("--data", type=Path)
     ap.add_argument("--config", type=Path)
     ap.add_argument("--save-path", type=Path)
-    ap.add_argument("--eval", action="store_true")
+    ap.add_argument("--finetune-from", type=Path)
+    ap.add_argument("--test", action="store_true")
+    ap.add_argument("--predict", action="store_true")
     ap.add_argument("--index", type=Path)
+    ap.add_argument("-o", "--output-path", type=Path, default=None)
     args = ap.parse_args()
     if args.config is not None:
         config = load_json(args.config)
@@ -162,8 +204,29 @@ if __name__ == "__main__":
     if args.save_path is not None:
         args.save_path = args.save_path.resolve()
 
-    if args.eval:
-        inference(args.data, args.save_path, args.index)
+    output_path = (
+        args.output_path
+        if args.output_path is not None
+        else args.save_path / "predictions.npz"
+    )
+    if args.predict:
+        inference(
+            args.data, args.save_path, index_file=args.index, output_path=output_path
+        )
+    elif args.test:
+        inference(
+            args.data,
+            args.save_path,
+            index_file=args.index,
+            output_path=output_path,
+            test_mode=True,
+        )
     else:
         args.save_path.mkdir(parents=True, exist_ok=True)
-        train_default(config, args.data, args.save_path, args.index)
+        train_default(
+            config,
+            args.data,
+            args.save_path,
+            args.index,
+            pretrained_path=args.finetune_from,
+        )

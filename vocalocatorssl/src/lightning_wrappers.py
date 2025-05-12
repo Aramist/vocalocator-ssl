@@ -14,13 +14,14 @@ def info_nce(
     labels: torch.Tensor,
     temperature: float = 1.0,
 ):
-    return torch.logsumexp(logits / temperature, dim=1).mean(dim=0) - logits.gather(
+    logits = logits / temperature
+    return torch.logsumexp(logits, dim=1).mean(dim=0) - logits.gather(
         dim=1, index=labels.unsqueeze(1)
     ).mean(dim=0)
 
 
 class LVocalocator(L.LightningModule):
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, is_finetuning: bool = False):
         """Lightning wrapper for Vocalocator model.
 
         Args:
@@ -30,21 +31,61 @@ class LVocalocator(L.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.config = config
+        self.is_finetuning = is_finetuning
 
         self.audio_encoder = utils.initialize_audio_embedder(config)
         self.location_encoder = utils.initialize_location_embedding(config)
         self.scorer = utils.initialize_scorer(config)
         self.augmentation_transform = utils.initialize_augmentations(config)
-        self.loss_fn = info_nce
+
+        self.register_buffer(
+            "minibatch_idx", torch.tensor(0, dtype=torch.long), persistent=True
+        )
+
+    def compute_temperature(self) -> torch.Tensor:
+        """Computes the temperature for the current traninig step. This controls how strongly hard
+        negative samples are penalized by the loss function.
+
+        Args:
+            batch_idx (int): Number of minibatches processed so far.
+
+        Returns:
+            float: Temperature for the current training step.
+        """
+        num_steps, initial_temp, final_temp = (
+            self.config["optimization"]["num_temperature_steps"],
+            self.config["optimization"]["initial_temperature"],
+            self.config["optimization"]["final_temperature"],
+        )
+        cur_step = torch.clamp(self.minibatch_idx, min=0, max=num_steps)
+        temp = initial_temp + ((final_temp - initial_temp) * cur_step / num_steps)
+        return temp
+
+    def on_train_start(self) -> None:
+        """Override to modify the model for finetuning if necessary."""
+        if self.is_finetuning:
+            ft_config = self.config["finetune"]
+            if "lora_rank" not in ft_config or "lora_alpha" not in ft_config:
+                raise ValueError(
+                    "LoRA rank and alpha must be specified in the finetuning config"
+                )
+            if ft_config["method"] == "lora":
+                print("Attempting to LoRAfy the model")
+                self.audio_encoder.LoRAfy(
+                    lora_rank=self.config["finetune"]["lora_rank"],
+                    lora_alpha=self.config["finetune"]["lora_alpha"],
+                    lora_dropout=0.0,  # Not implemented yet
+                )
+            print(self)
 
     def forward(
-        self, audio, labels, shuffle: bool = True
+        self, audio: torch.Tensor, labels: torch.Tensor, shuffle: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Computes scores between audio and labels.
 
         Args:
-            audio (_type_): Audio (batch, time, channels)
-            labels (_type_): Labels (batch, 1+num_negative, animals, nodes, dims)
+            audio (torch.Tensor): Audio (batch, time, channels)
+            labels (torch.Tensor): Labels (batch, 1+num_negative, animals, nodes, dims)
             shuffle (bool, optional): Whether labels are shuffled. Defaults to True.
 
         Returns:
@@ -65,14 +106,14 @@ class LVocalocator(L.LightningModule):
                 bsz, dtype=torch.long, device=labels.device
             )
 
-        # audio_embeddings: (bsz, features)
+        # audio_embeddings: (bsz, a_features)
         audio_embedding = self.audio_encoder(audio)
-        # location_embeddings: (bsz, 1+num_negative, num_animals, features)
+        # location_embeddings: (bsz, 1+num_negative, num_animals, l_features)
         location_embedding = self.location_encoder(labels)
 
         # Make audio embeddings broadcastable
-        audio_embedding = audio_embedding[:, None, None, :].expand_as(
-            location_embedding
+        audio_embedding = audio_embedding[:, None, None, :].expand(
+            *location_embedding.shape[:-1], -1
         )
 
         # Scores: (batch, 1+num_negative, num_animals)
@@ -98,9 +139,12 @@ class LVocalocator(L.LightningModule):
         audio = self.augmentation_transform(audio)
 
         scores, positive_label_index = self.forward(audio, labels)
-        loss = self.loss_fn(scores, positive_label_index)
+        temperature = self.compute_temperature()
+        loss = info_nce(scores, positive_label_index, temperature=temperature)
 
-        self.log("train_loss", loss, on_epoch=True)
+        self.minibatch_idx += 1
+        self.log("infonce_temperature", temperature, on_step=True, sync_dist=False)
+        self.log("train_loss", loss, on_epoch=True, on_step=False, sync_dist=False)
         return loss
 
     def validation_step(
@@ -125,12 +169,15 @@ class LVocalocator(L.LightningModule):
         )
         acc = metric(scores, positive_label_index)
 
-        self.log("val_acc", acc, on_epoch=True, sync_dist=True)
+        self.log("val_acc", acc, on_epoch=True, sync_dist=True, on_step=False)
         return acc
+
+    def on_predict_start(self):
+        print(f"Starting prediction with temperature: {self.compute_temperature():.2f}")
 
     def predict_step(
         self, batch: dict[str, torch.Tensor], *args: Any
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, np.ndarray]:
         """Computes score distributions for each candidate source location for each
         sound in the batch.
 
@@ -149,111 +196,117 @@ class LVocalocator(L.LightningModule):
         if len(labels.shape) == 4:
             labels = labels.unsqueeze(0)  # Create batch dim
 
-        labels = labels[:, :, 0, :, :]  # Assume only one animal per label
+        # labels = labels[:, :, 0, :, :]  # Assume only one animal per label
+        labels = labels[:, 0, :, :, :]  # Assume no negatives
 
         audio_embeddings = self.audio_encoder(audio)  # (b, feats)
-        location_embeddings = self.location_encoder(
-            labels
-        )  # (b, n_negative + 1, feats)
+        location_embeddings = self.location_encoder(labels)  # (b, n_animals, feats)
         audio_embeddings = audio_embeddings[:, None, :].expand(
             *location_embeddings.shape[:-1],
             -1,  # d_audio_embed not necessarily equal to d_loc_embed
         )
 
-        scores = self.scorer(
-            audio_embeddings, location_embeddings
-        )  # (b, n_negative + 1)
+        scores = self.scorer(audio_embeddings, location_embeddings)  # (b, n_animals)
+        # Ensure the same temperature used during training is applied at inference time
+        scores = scores / self.compute_temperature()
+        # pmfs = (
+        #     self.make_pmf(batch).cpu().numpy().astype(np.float64)
+        # )  # (b, n_theta, n_y, n_x)
+        # pmfs = utils.numpy_softmax(pmfs, axis=(1, 2, 3))
+        # conf_sets = utils.compute_confidence_set(pmfs, 0.95)
+        # assignments = [
+        #     utils.point_in_conf_set(
+        #         cset, n_ad_pos, range=np.array([[-1.1, 1.1], [-1.1, 1.1]])
+        #     )
+        #     for cset, n_ad_pos in zip(conf_sets, labels.cpu().numpy())
+        # ]
+        # assignments = np.array(assignments)
+
         return labels, scores
 
-    # def predict_step(
-    #     self, batch: dict[str, torch.Tensor], *args: Any
-    # ) -> tuple[torch.Tensor, torch.Tensor]:
-    #     """Computes score distributions for each candidate source location for each
-    #     sound in the batch.
+    def make_pmf(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Computes score distributions for each candidate source location for each
+        sound in the batch.
 
-    #     Args:
-    #         batch (dict[str, torch.Tensor]): Batch of audio samples and candidate locations.
-    #             audio is expected to have shape (batch, time, channels)
-    #             locations are expected to have shape (batch, num_negative + 1, num_animals, num_nodes, num_dims)
+        Args:
+            batch (dict[str, torch.Tensor]): Batch of audio samples and candidate locations.
+                audio is expected to have shape (batch, time, channels)
+                locations are expected to have shape (batch, num_negative + 1, num_animals, num_nodes, num_dims)
 
-    #     Returns:
-    #         torch.Tensor: Normalized probability distributions over arena (batch, num_z, num_y, num_x)
-    #     """
-    #     audio = batch["audio"]
-    #     labels = batch["labels"]
-    #     if len(audio.shape) == 2:
-    #         audio = audio.unsqueeze(0)  # Create batch dim
-    #     if len(labels.shape) == 4:
-    #         labels = labels.unsqueeze(0)  # Create batch dim
+        Returns:
+            torch.Tensor: Normalized probability distributions over arena (batch, num_angle, num_y, num_x)
+        """
+        audio = batch["audio"]
+        labels = batch["labels"]
+        if len(audio.shape) == 2:
+            audio = audio.unsqueeze(0)  # Create batch dim
+        if len(labels.shape) == 4:
+            labels = labels.unsqueeze(0)  # Create batch dim
 
-    #     if labels.shape[1] != 1:
-    #         raise ValueError(
-    #             "Predict step expects a single positive label, but got multiple"
-    #         )
+        labels_to_save = labels[:, 0, :, :, :]  # Assume no negatives
+        labels = labels_to_save[:, 0, :, :]  # (b, n_nodes, n_dims)
 
-    #     labels = labels.squeeze(1)  # num_negative exepcted to be 0
-    #     labels = labels[:, 0, :, :]  # (b, n_nodes, n_dims)
+        head_to_nose = labels[:, 0, :] - labels[:, 1, :]  # (b, 3)
+        # Expand to multiple orientations
+        # We will consider shifting the orientation 15, 30, 45 in either direction
+        num_angles = 120
 
-    #     head_to_nose = labels[:, 0, :] - labels[:, 1, :]  # (b, 3)
-    #     # Expand to multiple orientations
-    #     # We will consider shifting the orientation 15, 30, 45 in either direction
-    #     num_angles = 120
-    #     angle_diffs_np = np.deg2rad(np.linspace(0, 360, num_angles, endpoint=False))
-    #     angle_diffs = torch.from_numpy(angle_diffs_np).float().to(labels.device)
+        # Distance from head to nose ignoring z dimension
+        h_t_n_xy_mag = torch.linalg.norm(head_to_nose[:, :2], dim=-1)  # (b, )
+        # Yaw angle from head to nose, relative to x+
+        new_h_t_n_xy_angle = (
+            torch.from_numpy(np.linspace(0, 2 * np.pi, num_angles))
+            .to(labels.device)
+            .to(labels.dtype)
+        ).expand(labels.shape[0], -1)  # (b, n_angle)
+        new_h_t_n = torch.stack(
+            [
+                h_t_n_xy_mag[:, None] * torch.cos(new_h_t_n_xy_angle),  # (b, n_angle)
+                h_t_n_xy_mag[:, None] * torch.sin(new_h_t_n_xy_angle),  # (b, n_angle)
+                head_to_nose[:, 2].unsqueeze(1).expand(-1, num_angles),  # (b, n_angle)
+            ],
+            dim=-1,
+        )  # (b, n_angle, 3)
 
-    #     h_t_n_xy_angle = torch.arctan2(head_to_nose[:, 1], head_to_nose[:, 0])  # (b, )
-    #     h_t_n_xy_mag = torch.linalg.norm(head_to_nose[:, :2], dim=-1)  # (b, )
-    #     new_h_t_n_xy_angle = (
-    #         h_t_n_xy_angle[:, None] + angle_diffs[None, :]
-    #     )  # (b, n_angle)
-    #     new_h_t_n = torch.stack(
-    #         [
-    #             h_t_n_xy_mag[:, None] * torch.cos(new_h_t_n_xy_angle),  # (b, n_angle)
-    #             h_t_n_xy_mag[:, None] * torch.sin(new_h_t_n_xy_angle),  # (b, n_angle)
-    #             head_to_nose[:, 2]
-    #             .unsqueeze(1)
-    #             .expand(-1, angle_diffs.shape[0]),  # (b, n_angle)
-    #         ],
-    #         dim=-1,
-    #     )  # (b, n_angle, 3)
+        grid = np.stack(
+            np.meshgrid(
+                np.linspace(-1.1, 1.1, 110),  # x
+                np.linspace(-1.1, 1.1, 110),  # y
+                [labels[:, 0, 2].mean(dim=0).cpu().numpy()],  # z
+            ),
+            axis=-1,
+        ).squeeze()  # (n_y, n_x, 3)
+        grid_head = (
+            torch.from_numpy(grid).float().to(labels.device)
+        )  # (n_z, n_y, n_x, 3)
+        grid_head = grid_head.reshape(1, 1, -1, 3)  # (1 (b), 1(n_angle), n_grid, 3)
+        # create nose points
+        grid_nose = grid_head + new_h_t_n[:, :, None, :]  # (b, n_angle, n_grid, 3)
+        grid_head = grid_head.expand_as(grid_nose)  # (b, n_grid, 3)
+        grid = torch.stack([grid_nose, grid_head], dim=-2)  # (b, n_angle, n_grid, 2, 3)
 
-    #     grid = np.stack(
-    #         np.meshgrid(
-    #             np.linspace(-1, 1, 100),  # x
-    #             np.linspace(-1, 1, 100),  # y
-    #             np.linspace(0.05, 0.05, 1),  # z
-    #         ),
-    #         axis=-1,
-    #     ).squeeze()  # (n_y, n_x, 3)
-    #     grid_head = (
-    #         torch.from_numpy(grid).float().to(labels.device)
-    #     )  # (n_z, n_y, n_x, 3)
-    #     grid_head = grid_head.reshape(1, 1, -1, 3)  # (1 (b), 1(n_angle), n_grid, 3)
-    #     # create nose points
-    #     grid_nose = grid_head + new_h_t_n[:, :, None, :]  # (b, n_angle, n_grid, 3)
-    #     grid_head = grid_head.expand_as(grid_nose)  # (b, n_grid, 3)
-    #     grid = torch.stack([grid_nose, grid_head], dim=-2)  # (b, n_angle, n_grid, 2, 3)
+        audio_embeddings = self.audio_encoder(audio)  # (b, feats)
+        location_embeddings = self.location_encoder(
+            grid
+        )  # (b, n_angle, n_grid, d_embed)
 
-    #     audio_embeddings = self.audio_encoder(audio)  # (b, feats)
-    #     location_embeddings = self.location_encoder(
-    #         grid
-    #     )  # (b, n_angle, n_grid, d_embed)
-
-    #     audio_embeddings = audio_embeddings[:, None, None, :].expand(
-    #         *location_embeddings.shape[:-1],
-    #         -1,  # d_audio_embed not necessarily equal to d_loc_embed
-    #     )
-    #     scores = self.scorer(
-    #         audio_embeddings, location_embeddings
-    #     )  # (b, n_angle, n_grid)
-    #     return labels, scores
+        audio_embeddings = audio_embeddings[:, None, None, :].expand(
+            *location_embeddings.shape[:-1],
+            -1,  # d_audio_embed not necessarily equal to d_loc_embed
+        )
+        scores = self.scorer(
+            audio_embeddings, location_embeddings
+        )  # (b, n_angle, n_grid)
+        scores = scores.reshape(-1, num_angles, 110, 110)  # (b*n_angle, n_grid)
+        scores = scores / self.compute_temperature()
+        return scores.to(torch.float16)
 
     def configure_optimizers(self):
         """Configures the optimizer and learning rate scheduler for a simple reduce-on-plateau
         setup."""
         optimizer = utils.initialize_optimizer(self.config, self.parameters())
         sched = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer=optimizer, patience=10, factor=0.1, mode="min"
+            optimizer=optimizer, patience=20, factor=0.5, mode="min"
         )
 
         return {

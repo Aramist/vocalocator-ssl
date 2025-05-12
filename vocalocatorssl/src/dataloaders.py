@@ -69,6 +69,7 @@ class VocalizationDataset(Dataset):
         index: Optional[np.ndarray] = None,
         normalize_data: bool = True,
         construct_search_tree: bool = True,
+        cache_locations: bool = True,
     ):
         """
         Args:
@@ -81,6 +82,7 @@ class VocalizationDataset(Dataset):
             index (Optional[np.ndarray], optional): An array of indices to use for this dataset. Defaults to None, which will use the full dataset
             normalize_data (bool, optional): Whether to normalize the audio data to have zero mean and unit variance. Defaults to True.
             construct_search_tree (bool, optional): Whether to construct a KDTree for the dataset. This is used for sampling negative locations. Defaults to True.
+            cache_locations (bool, optional): Whether to cache the locations in memory. This greatly accelerates training, but uses more memory. Defaults to True.
         """
         if isinstance(dataset_path, str):
             dataset_path = Path(dataset_path)
@@ -91,6 +93,9 @@ class VocalizationDataset(Dataset):
         # This is because h5py handles cannot be pickled and pytorch uses pickle under the hood
         # I get around this by re-initializing the h5py.File lazily in __getitem__
         self.dataset: Optional[h5py.File] = None
+        self.location_cache: Optional[np.ndarray] = None
+        if cache_locations:
+            self.location_cache = dataset["locations"][:]
 
         if not isinstance(arena_dims, np.ndarray):
             arena_dims = np.array(arena_dims).astype(np.float32)
@@ -128,11 +133,13 @@ class VocalizationDataset(Dataset):
             self.node_indices = np.array(self.node_indices)
 
         multi_animal = len(dataset["locations"].shape) > 3
-        if multi_animal and construct_search_tree:  # only needed for training
+        if construct_search_tree:  # only needed for training
             # Expected shape: (dataset_size, n_animals, n_nodes, n_dims)
             animal_configurations: np.ndarray = dataset["locations"][
                 ..., self.node_indices[0], :
             ]
+            if not multi_animal:
+                animal_configurations = animal_configurations[:, None, ...]
 
             animal_configurations = animal_configurations[self.index, ...]
             animal_configurations = animal_configurations[
@@ -210,6 +217,71 @@ class VocalizationDataset(Dataset):
         range_end = range_start + crop_length
         return audio[range_start:range_end, :]
 
+    def __approximate_sampling_strategy(
+        self, center: np.ndarray, radius: float, num_samples: int, area_ratio: float
+    ) -> torch.Tensor:
+        """A faster, approximate sampling strategy for sampling negative locations within some distance
+        of a center point. This is faster when the search radius encompases a large portion of the dataset.
+
+        Args:
+            center (np.ndarray): Center of the search radius
+            radius (float): Search radius
+            num_samples (int): Number of samples to return
+            area_ratio (float): Ratio of the area of the search radius to the area of the arena
+        """
+        # Assuming a uniform distribution of points in the arena, we should expect n points in the search
+        # radius by sampling this many points from the arena.
+        excessive_samples = int(num_samples / area_ratio)
+        samples_idx = self.rng.choice(self.index, size=excessive_samples, replace=False)
+        samples_coords = self.__labels_for_indices(samples_idx).numpy()
+        center = center.reshape(1, -1)
+        in_radius = (
+            np.square(samples_coords.mean(axis=1)[:, 0, :2] - center).sum(axis=-1)
+            < radius**2
+        )
+        not_in_radius = ~in_radius
+        # If there are not enough points in the radius, don't waste time resampling
+        num_in_radius_to_take = min(num_samples, in_radius.sum())
+        num_not_in_radius_to_take = num_samples - num_in_radius_to_take
+        pts = np.concatenate(
+            [
+                samples_coords[in_radius, ...][:num_in_radius_to_take],
+                samples_coords[not_in_radius, ...][:num_not_in_radius_to_take],
+            ],
+            axis=0,
+        )
+        return torch.from_numpy(pts.astype(np.float32))
+
+    def __exact_sampling_strategy(
+        self,
+        center: np.ndarray,
+        radius: float,
+        num_samples: int,
+    ) -> torch.Tensor:
+        """An exact sampling strategy for sampling negative locations within some distance
+        of a center point. This is slower than the approximate strategy for large radii, but
+        faster for small radii.
+
+        Args:
+            center (np.ndarray): Center of the search radius
+            radius (float): Search radius
+            num_samples (int): Number of samples to return
+        """
+        # Compute the indices of the points within the search radius
+        # Sample a point within the search radius
+        points_in_radius = self.search_tree.query_ball_point(center, radius)
+        if len(points_in_radius) < self.num_negative_samples:
+            # get more entropy by sampling nearest neighbors
+            _, points_in_radius = self.search_tree.query(
+                center, k=self.num_negative_samples * 2
+            )
+            points_in_radius = points_in_radius[1:]  # Exclude the point itself
+
+        # Sample a random point from the points in the radius
+        sample_idx = self.rng.choice(points_in_radius, size=num_samples, replace=False)
+        # The indices in the KDTree are already in the range [0, len(self.index))
+        return torch.stack([self.__label_for_index(s_i) for s_i in sample_idx], dim=0)
+
     def sample_negative_location(
         self, idx: int, difficulty: Optional[float], *, n: int = 1
     ) -> torch.Tensor:
@@ -238,23 +310,26 @@ class VocalizationDataset(Dataset):
             int(difficulty * (len(self.pairwise_distance_quantiles) - 1))
         ]
         ## Experimental: use only x and y coordinates to make this faster
-        search_center = self.__label_for_index(idx).mean(dim=0).reshape(-1)[:2]
+        search_center = self.__label_for_index(idx).mean(dim=0).reshape(-1)[:2].numpy()
 
-        # Sample a point within the search radius
-        points_in_radius = self.search_tree.query_ball_point(
-            search_center.numpy(), search_radius
-        )
-        if len(points_in_radius) < self.num_negative_samples:
-            # get more entropy by sampling nearest neighbors
-            _, points_in_radius = self.search_tree.query(
-                search_center.numpy(), k=self.num_negative_samples * 2
+        # Estimate the area of the search radius to determing which strategy to use
+        grid = np.stack(
+            np.meshgrid(
+                np.linspace(-self.arena_dims[0] / 2, self.arena_dims[0] / 2, 10),
+                np.linspace(-self.arena_dims[1] / 2, self.arena_dims[1] / 2, 10),
+            ),
+            axis=-1,
+        )  # (10, 10, 2)
+        grid = grid.reshape(-1, 2)  # (100, 2)
+        in_radius = np.square(grid - search_center).sum(axis=1) < search_radius**2
+        prop_in_radius = in_radius.mean()
+
+        if prop_in_radius < 0.2:
+            return self.__exact_sampling_strategy(search_center, search_radius, n)
+        else:
+            return self.__approximate_sampling_strategy(
+                search_center, search_radius, n, prop_in_radius
             )
-            points_in_radius = points_in_radius[1:]  # Exclude the point itself
-
-        # Sample a random point from the points in the radius
-        sample_idx = self.rng.choice(points_in_radius, size=n, replace=False)
-        # The indices in the KDTree are already in the range [0, len(self.index))
-        return torch.stack([self.__label_for_index(s_i) for s_i in sample_idx], dim=0)
 
     def __audio_for_index(self, idx: int):
         """Gets an audio sample from the dataset. Will determine the format
@@ -262,7 +337,7 @@ class VocalizationDataset(Dataset):
         """
         start, end = self.dataset["length_idx"][idx : idx + 2]
         audio = self.dataset["audio"][start:end, ...]
-        return torch.from_numpy(audio.astype(np.float32))
+        return torch.from_numpy(audio)
 
     def __label_for_index(self, idx: int) -> torch.Tensor:
         """Gets the ground truth source location for the vocalization at the given index
@@ -274,11 +349,37 @@ class VocalizationDataset(Dataset):
             torch.Tensor: The source location of the vocalization, if available. Shape: (n_animals, n_node, n_dim). Unit: dataset unit
         """
 
-        locs = self.dataset["locations"][idx, ..., self.node_indices, :]
+        if self.location_cache is not None:
+            locs = self.location_cache[idx]
+        else:
+            locs = self.dataset["locations"][idx]
+        locs = locs[..., self.node_indices, :]
         # either (n_animals, n_nodes, n_dims) if len(locs.shape) == 3
         # or (n_nodes, n_dims)
         if len(locs.shape) == 2:
+            # allow evaluating or training on single animal datasets
             locs = locs[None, ...]
+
+        locs = torch.from_numpy(locs.astype(np.float32))
+        return locs
+
+    def __labels_for_indices(self, indices: np.ndarray) -> torch.Tensor:
+        """Gets the ground truth source location for the vocalization at the given indices
+
+        Args:
+            indices (np.ndarray): Indices of the vocalizations
+
+        Returns:
+            torch.Tensor: The source location of the vocalizations, if available. Shape: (n_animals, n_node, n_dim). Unit: dataset unit
+        """
+        if self.location_cache is None:
+            return torch.stack([self.__label_for_index(i) for i in indices], dim=0)
+        locs = self.location_cache[indices][..., self.node_indices, :]
+        # either (n_animals, n_nodes, n_dims) if len(locs.shape) == 3
+        # or (n_nodes, n_dims)
+        if len(locs.shape) == 3:
+            # allow evaluating or training on single animal datasets
+            locs = locs[:, None, ...]
         locs = torch.from_numpy(locs.astype(np.float32))
         return locs
 
@@ -411,9 +512,9 @@ def get_logical_cores():
     """Gets the number of logical cores available to the program."""
     try:
         # I think this function only exists on linux
-        return max(1, len(os.sched_getaffinity(0)) - 1)
+        return max(1, len(os.sched_getaffinity(0)) - 2)
     except:
-        return max(1, os.cpu_count() - 1)
+        return max(1, os.cpu_count() - 2)
 
 
 def build_dataloaders(
@@ -519,6 +620,7 @@ def build_dataloaders(
         batch_size=batch_size,
         num_workers=avail_cpus,
         collate_fn=collate,
+        pin_memory=True,
         sampler=DifficultySampler(
             training_dataset,
             difficulty_range=difficulty_range,
@@ -533,6 +635,7 @@ def build_dataloaders(
         batch_size=batch_size,
         collate_fn=collate,
         num_workers=avail_cpus,
+        pin_memory=True,
         sampler=DifficultySampler(
             validation_dataset,
             shuffle=False,
@@ -575,6 +678,7 @@ def build_inference_dataset(
     crop_length: int,
     normalize_data: bool,
     node_names: list[str],
+    num_inference_samples: int = 200,
 ) -> DataLoader:
     """Constructs a single dataset for performing inference on a dataset.
 
@@ -604,7 +708,8 @@ def build_inference_dataset(
         index=indices,
         normalize_data=normalize_data,
         nodes=node_names,
-        num_negative_samples=200,
+        num_negative_samples=num_inference_samples,
+        construct_search_tree=False,
     )
 
     loader = DataLoader(

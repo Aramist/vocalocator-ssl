@@ -6,10 +6,10 @@ import pyjson5
 from torch import nn, optim
 from torch.utils.data import DataLoader
 
-from .architectures import AudioEmbedder, ResnetConformer, SimpleNet
+from .audio_embed import AudioEmbedder, ResnetConformer, SimpleNet
 from .augmentations import AugmentationConfig, build_augmentations
 from .dataloaders import build_dataloaders, build_inference_dataset
-from .embeddings import FourierEmbedding, LocationEmbedding, MLPEmbedding
+from .location_embed import FourierEmbedding, LocationEmbedding, MLPEmbedding
 from .scorers import CosineSimilarityScorer, MLPScorer, Scorer
 
 
@@ -365,12 +365,17 @@ def initialize_inference_dataloader(
     num_inference_samples = (
         config["evaluation"]["num_samples_per_vocalization"] if test_mode else 0
     )
+    batch_size = (
+        config["evaluation"].get("eval_batch_size", 1)
+        if test_mode
+        else config["dataloader"]["batch_size"]
+    )
     dataloader = build_inference_dataset(
         dataset_path,
         index_path,
         arena_dims=config["dataloader"]["arena_dims"],
         crop_length=config["dataloader"]["crop_length"],
-        batch_size=1,
+        batch_size=batch_size,
         normalize_data=config["dataloader"].get("normalize_data", True),
         node_names=config["dataloader"].get("nodes_to_load", None),
         num_inference_samples=num_inference_samples,

@@ -209,6 +209,7 @@ class MixedEmbedding(LocationEmbedding):
         d_hidden: int = 128,
         num_layers: int = 2,
         init_bandwidth: float = 0.3,
+        **kwargs,  # Don't crash if we get extra kwargs
     ):
         """Creates an embedding that incorporates prior beliefs about each input dimension
         Args:

@@ -37,6 +37,7 @@ class LVocalocator(L.LightningModule):
         self.location_encoder = utils.initialize_location_embedding(config)
         self.scorer = utils.initialize_scorer(config)
         self.augmentation_transform = utils.initialize_augmentations(config)
+        self.test_flag = False  # Used during predict_step to determine behavior
 
         self.register_buffer(
             "minibatch_idx", torch.tensor(0, dtype=torch.long), persistent=True
@@ -177,7 +178,7 @@ class LVocalocator(L.LightningModule):
 
     def predict_step(
         self, batch: dict[str, torch.Tensor], *args: Any
-    ) -> tuple[torch.Tensor, torch.Tensor, np.ndarray]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Computes score distributions for each candidate source location for each
         sound in the batch.
 
@@ -187,7 +188,8 @@ class LVocalocator(L.LightningModule):
                 locations are expected to have shape (batch, num_negative + 1, num_animals, num_nodes, num_dims)
 
         Returns:
-            torch.Tensor: Normalized probability distributions over arena (batch, num_z, num_y, num_x)
+            torch.Tensor: Labels provided as input
+            torch.Tensor: Scores for each animal (batch, n_animals)
         """
         audio = batch["audio"]
         labels = batch["labels"]
@@ -196,8 +198,10 @@ class LVocalocator(L.LightningModule):
         if len(labels.shape) == 4:
             labels = labels.unsqueeze(0)  # Create batch dim
 
-        # labels = labels[:, :, 0, :, :]  # Assume only one animal per label
-        labels = labels[:, 0, :, :, :]  # Assume no negatives
+        if self.test_flag:
+            labels = labels.squeeze(2)  # Assume only one animal per label
+        else:
+            labels = labels.squeeze(1)  # Assume no negatives
 
         audio_embeddings = self.audio_encoder(audio)  # (b, feats)
         location_embeddings = self.location_encoder(labels)  # (b, n_animals, feats)
@@ -209,18 +213,6 @@ class LVocalocator(L.LightningModule):
         scores = self.scorer(audio_embeddings, location_embeddings)  # (b, n_animals)
         # Ensure the same temperature used during training is applied at inference time
         scores = scores / self.compute_temperature()
-        # pmfs = (
-        #     self.make_pmf(batch).cpu().numpy().astype(np.float64)
-        # )  # (b, n_theta, n_y, n_x)
-        # pmfs = utils.numpy_softmax(pmfs, axis=(1, 2, 3))
-        # conf_sets = utils.compute_confidence_set(pmfs, 0.95)
-        # assignments = [
-        #     utils.point_in_conf_set(
-        #         cset, n_ad_pos, range=np.array([[-1.1, 1.1], [-1.1, 1.1]])
-        #     )
-        #     for cset, n_ad_pos in zip(conf_sets, labels.cpu().numpy())
-        # ]
-        # assignments = np.array(assignments)
 
         return labels, scores
 

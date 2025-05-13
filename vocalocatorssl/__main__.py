@@ -165,6 +165,7 @@ def inference(
     )
 
     trainer = make_trainer(config, save_directory, logger=False)
+    model.test_flag = test_mode  # Cant pass additional args into predict_step
     preds: tp.Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = (
         trainer.predict(
             model,
@@ -194,8 +195,9 @@ if __name__ == "__main__":
     ap.add_argument("-o", "--output-path", type=Path, default=None)
     args = ap.parse_args()
     if args.config is not None:
+        # If we have a config, use it to override defualts / pretrain config
         config = load_json(args.config)
-    elif args.eval:
+    elif args.predict or args.test:
         config = None
     else:
         # config cannot be none during training

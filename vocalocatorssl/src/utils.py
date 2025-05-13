@@ -9,7 +9,12 @@ from torch.utils.data import DataLoader
 from .audio_embed import AudioEmbedder, ResnetConformer, SimpleNet
 from .augmentations import AugmentationConfig, build_augmentations
 from .dataloaders import build_dataloaders, build_inference_dataset
-from .location_embed import FourierEmbedding, LocationEmbedding, MLPEmbedding
+from .location_embed import (
+    FourierEmbedding,
+    LocationEmbedding,
+    MixedEmbedding,
+    MLPEmbedding,
+)
 from .scorers import CosineSimilarityScorer, MLPScorer, Scorer
 
 
@@ -289,6 +294,8 @@ def initialize_location_embedding(config: dict) -> LocationEmbedding:
         emb = FourierEmbedding(**config["location_embedding_params"])
     elif emb_type == "mlp":
         emb = MLPEmbedding(**config["location_embedding_params"])
+    elif emb_type == "mixed":
+        emb = MixedEmbedding(**config["location_embedding_params"])
     else:
         raise ValueError(f"Unrecognized location embedding type {emb_type}")
 
@@ -455,6 +462,11 @@ def point_in_conf_set(
     y_bin = np.clip(y_bin, 0, conf_set.shape[1] - 1)
     x_bin = np.digitize(point[:, 0, 0], x_bins) - 1  # (n_pts,)
     x_bin = np.clip(x_bin, 0, conf_set.shape[2] - 1)
+    # Check if the point is in the confidence set
+    result = conf_set[angle_idx, y_bin, x_bin]  # (n_pts,)
+    # Reshape the result to match the batch size
+    result = result.reshape(*batch_size)
+    return result
     # Check if the point is in the confidence set
     result = conf_set[angle_idx, y_bin, x_bin]  # (n_pts,)
     # Reshape the result to match the batch size

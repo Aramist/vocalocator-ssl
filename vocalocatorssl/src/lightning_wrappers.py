@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from torch import optim
 from torchmetrics.classification import MulticlassAccuracy
+from tqdm import trange
 
 from . import utils
 
@@ -37,11 +38,15 @@ class LVocalocator(L.LightningModule):
         self.location_encoder = utils.initialize_location_embedding(config)
         self.scorer = utils.initialize_scorer(config)
         self.augmentation_transform = utils.initialize_augmentations(config)
-        self.test_flag = False  # Used during predict_step to determine behavior
+        self.flags = {
+            "predict_test_mode": False,
+            "predict_gen_pmfs": False,
+        }
 
         self.register_buffer(
             "minibatch_idx", torch.tensor(0, dtype=torch.long), persistent=True
         )
+        self.cached_location_embeddings_grid = None
 
     def compute_temperature(self) -> torch.Tensor:
         """Computes the temperature for the current traninig step. This controls how strongly hard
@@ -178,7 +183,10 @@ class LVocalocator(L.LightningModule):
 
     def predict_step(
         self, batch: dict[str, torch.Tensor], *args: Any
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ):
         """Computes score distributions for each candidate source location for each
         sound in the batch.
 
@@ -198,7 +206,7 @@ class LVocalocator(L.LightningModule):
         if len(labels.shape) == 4:
             labels = labels.unsqueeze(0)  # Create batch dim
 
-        if self.test_flag:
+        if self.flags["predict_test_mode"]:
             labels = labels.squeeze(2)  # Assume only one animal per label
         else:
             labels = labels.squeeze(1)  # Assume no negatives
@@ -213,6 +221,11 @@ class LVocalocator(L.LightningModule):
         scores = self.scorer(audio_embeddings, location_embeddings)  # (b, n_animals)
         # Ensure the same temperature used during training is applied at inference time
         scores = scores / self.compute_temperature()
+
+        if self.flags["predict_gen_pmfs"]:
+            # Generate PMFs for each animal
+            pmfs = self.make_pmf(batch)
+            return labels, scores, pmfs
 
         return labels, scores
 
@@ -235,63 +248,126 @@ class LVocalocator(L.LightningModule):
         if len(labels.shape) == 4:
             labels = labels.unsqueeze(0)  # Create batch dim
 
-        labels_to_save = labels[:, 0, :, :, :]  # Assume no negatives
-        labels = labels_to_save[:, 0, :, :]  # (b, n_nodes, n_dims)
+        labels = labels.squeeze(
+            1
+        )  # Assume no negatives  (b, n_animals, n_nodes, n_dims)
 
-        head_to_nose = labels[:, 0, :] - labels[:, 1, :]  # (b, 3)
-        # Expand to multiple orientations
-        # We will consider shifting the orientation 15, 30, 45 in either direction
-        num_angles = 120
+        head_to_nose_dist = torch.linalg.norm(
+            labels[..., 0, :] - labels[..., 1, :], axis=-1
+        ).mean()  # (,)
+        # Grid resolution
+        num_theta = 8
+        num_phi = 1
+        num_xy = 55
+        num_z = 3
 
-        # Distance from head to nose ignoring z dimension
-        h_t_n_xy_mag = torch.linalg.norm(head_to_nose[:, :2], dim=-1)  # (b, )
-        # Yaw angle from head to nose, relative to x+
-        new_h_t_n_xy_angle = (
-            torch.from_numpy(np.linspace(0, 2 * np.pi, num_angles))
-            .to(labels.device)
-            .to(labels.dtype)
-        ).expand(labels.shape[0], -1)  # (b, n_angle)
-        new_h_t_n = torch.stack(
-            [
-                h_t_n_xy_mag[:, None] * torch.cos(new_h_t_n_xy_angle),  # (b, n_angle)
-                h_t_n_xy_mag[:, None] * torch.sin(new_h_t_n_xy_angle),  # (b, n_angle)
-                head_to_nose[:, 2].unsqueeze(1).expand(-1, num_angles),  # (b, n_angle)
-            ],
-            dim=-1,
-        )  # (b, n_angle, 3)
+        # Grid size
+        theta_min = 0
+        theta_max = 2 * np.pi
+        phi_min = np.pi / 2 - 0.1
+        phi_max = np.pi / 2
+        xy_min = -1.1
+        xy_max = 1.1
+        z_min = 0.05
+        z_max = 0.2
 
-        grid = np.stack(
+        theta = np.linspace(theta_min, theta_max, num_theta).reshape(-1, 1)
+        phi = np.linspace(phi_min, phi_max, num_phi).reshape(1, -1)
+        animal_direction = (
+            np.stack(
+                [
+                    np.cos(theta) * np.sin(phi),
+                    np.sin(theta) * np.sin(phi),
+                    np.broadcast_to(np.cos(phi).reshape(1, -1), (num_theta, num_phi)),
+                ],
+                axis=-1,
+            )
+            * head_to_nose_dist.cpu().item()
+        )  # (n_theta, n_phi, 3)
+        animal_direction = torch.from_numpy(animal_direction).float().to(labels.device)
+
+        head_location = np.stack(
             np.meshgrid(
-                np.linspace(-1.1, 1.1, 110),  # x
-                np.linspace(-1.1, 1.1, 110),  # y
-                [labels[:, 0, 2].mean(dim=0).cpu().numpy()],  # z
-            ),
+                np.linspace(xy_min, xy_max, num_xy),
+                np.linspace(xy_min, xy_max, num_xy),
+                np.linspace(z_min, z_max, num_z),
+                indexing="ij",
+            ),  # returns tuple x,y,z with coords (x,y,z)
             axis=-1,
-        ).squeeze()  # (n_y, n_x, 3)
-        grid_head = (
-            torch.from_numpy(grid).float().to(labels.device)
-        )  # (n_z, n_y, n_x, 3)
-        grid_head = grid_head.reshape(1, 1, -1, 3)  # (1 (b), 1(n_angle), n_grid, 3)
-        # create nose points
-        grid_nose = grid_head + new_h_t_n[:, :, None, :]  # (b, n_angle, n_grid, 3)
-        grid_head = grid_head.expand_as(grid_nose)  # (b, n_grid, 3)
-        grid = torch.stack([grid_nose, grid_head], dim=-2)  # (b, n_angle, n_grid, 2, 3)
+        ).transpose(2, 1, 0, 3)  # (n_z, n_y, n_x, 3)
+        head_location = torch.from_numpy(head_location).float().to(labels.device)
+
+        # Combine get the nose location from the head location and the animal direction
+        head_location = head_location.reshape(1, 1, num_z, num_xy, num_xy, 3)
+        animal_direction = animal_direction.reshape(num_theta, num_phi, 1, 1, 1, 3)
+        nose_location = (
+            head_location + animal_direction
+        )  # (n_theta, n_phi, n_z, n_y, n_x, 3)
+
+        head_location = head_location.expand_as(nose_location)
+        animal_pose = torch.stack([nose_location, head_location], dim=-2)
+        # (n_theta, n_phi, n_z, n_y, n_x, 2, 3)
 
         audio_embeddings = self.audio_encoder(audio)  # (b, feats)
-        location_embeddings = self.location_encoder(
-            grid
-        )  # (b, n_angle, n_grid, d_embed)
+        # No batch dimension in location_embeddings bc we only need one grid for all the animals
+        # Compute location embeddings in batches to avoid OOM
+        location_embeddings = self.cached_location_embeddings_grid
+        if location_embeddings is None:
+            try:
+                location_embeddings = self.location_encoder(
+                    animal_pose
+                ).cpu()  # (n_theta, n_phi, n_z, n_y, n_x, feats)
+                location_embeddings = location_embeddings.reshape(
+                    -1, location_embeddings.shape[-1]
+                )
+            except RuntimeError as e:
+                print(f"OOM error in computing location embeddings: {e}")
+                print("Attempting to compute in batches...")
+                location_embeddings = torch.empty(
+                    (
+                        num_theta * num_phi * num_z * num_xy * num_xy,
+                        self.location_encoder.d_embedding,
+                    ),
+                    dtype=torch.float32,
+                )
+                flat_pose = animal_pose.reshape(
+                    num_theta * num_phi * num_z * num_xy * num_xy, 2, 3
+                )
+                bsize = 2048
+                num_batches = int(np.ceil(location_embeddings.shape[0] / bsize))
+                for i in range(num_batches):
+                    bstart = i * bsize
+                    bend = min((i + 1) * bsize, location_embeddings.shape[0])
+                    location_embeddings[bstart:bend] = self.location_encoder(
+                        flat_pose[bstart:bend].cuda()
+                    ).cpu()
+            self.cached_location_embeddings_grid = location_embeddings
 
-        audio_embeddings = audio_embeddings[:, None, None, :].expand(
-            *location_embeddings.shape[:-1],
-            -1,  # d_audio_embed not necessarily equal to d_loc_embed
-        )
-        scores = self.scorer(
-            audio_embeddings, location_embeddings
-        )  # (b, n_angle, n_grid)
-        scores = scores.reshape(-1, num_angles, 110, 110)  # (b*n_angle, n_grid)
-        scores = scores / self.compute_temperature()
-        return scores.to(torch.float16)
+        pmfs = []
+        temp = self.compute_temperature().cpu()
+        for audio_e in audio_embeddings:
+            batch_size = 512
+            audio_e = audio_e.unsqueeze(0).expand(batch_size, -1)
+            scores = torch.zeros(
+                (num_theta * num_phi * num_z * num_xy * num_xy,), dtype=torch.float64
+            )
+            for batch_start in trange(0, len(scores), batch_size):
+                batch_end = min(batch_start + batch_size, len(scores))
+                loc_batch = location_embeddings[batch_start:batch_end].cuda()
+                scores[batch_start:batch_end] = (
+                    self.scorer(audio_e[: len(loc_batch)], loc_batch)
+                    .cpu()
+                    .to(torch.float64)
+                    / temp
+                )
+
+            # This part gets expensive
+            scores = torch.softmax(scores, dim=0)
+            # Sum over phi, z
+            scores = scores.reshape(num_theta, num_phi, num_z, num_xy, num_xy)
+            scores = scores.sum(dim=(1, 2))  # (n_theta, n_y, n_x)
+            pmfs.append(scores.to(torch.float32))
+        return torch.stack(pmfs)
 
     def configure_optimizers(self):
         """Configures the optimizer and learning rate scheduler for a simple reduce-on-plateau

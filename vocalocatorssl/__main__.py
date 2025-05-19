@@ -132,6 +132,7 @@ def inference(
     output_path: Path,
     index_file: tp.Optional[Path] = None,
     test_mode: bool = False,
+    make_pmfs: bool = False,
 ):
     """Runs inference on a dataset using the trained model located at `save_directory`.
 
@@ -164,8 +165,14 @@ def inference(
         model.config, data_path, index_file, test_mode=test_mode
     )
 
-    trainer = make_trainer(config, save_directory, logger=False)
-    model.test_flag = test_mode  # Cant pass additional args into predict_step
+    trainer = make_trainer(
+        config,
+        save_directory,
+        logger=False,
+    )
+    make_pmfs = make_pmfs and not test_mode  # Mutually exclusive
+    model.flags["predict_test_mode"] = test_mode  # Hack to pass args into predict_step
+    model.flags["predict_gen_pmfs"] = make_pmfs
     preds: tp.Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = (
         trainer.predict(
             model,
@@ -180,7 +187,26 @@ def inference(
 
     labels = torch.cat(labels, dim=0).cpu().numpy()
     scores = torch.cat(scores, dim=0).cpu().numpy()
-    np.savez(output_path, labels=labels, scores=scores)
+
+    if make_pmfs:
+        pmfs = [x[2] for x in preds]
+        pmfs = torch.cat(pmfs, dim=0).cpu().numpy()
+        np.savez(output_path, labels=labels, scores=scores, pmfs=pmfs)
+    else:
+        np.savez(output_path, labels=labels, scores=scores)
+
+    if test_mode:
+        # Compute and report accuracy
+        dist_bins, accs = utilsmodule.compute_test_accuracy(
+            labels, scores, dloader.dataset.arena_dims
+        )
+
+        with open(save_directory / "test_accuracy.txt", "w") as ctx:
+            print("Distance (cm)\tAccuracy (%)")
+            ctx.write("Distance (cm)\tAccuracy (%)\n")
+            for dist, acc in zip(dist_bins, accs):
+                print(f"{float(dist):.1f}\t{float(acc):.1%}")
+                ctx.write(f"{float(dist):.1f}\t{float(acc):.1%}\n")
 
 
 if __name__ == "__main__":
@@ -192,6 +218,7 @@ if __name__ == "__main__":
     ap.add_argument("--test", action="store_true")
     ap.add_argument("--predict", action="store_true")
     ap.add_argument("--index", type=Path)
+    ap.add_argument("--gen-pmfs", action="store_true")
     ap.add_argument("-o", "--output-path", type=Path, default=None)
     args = ap.parse_args()
     if args.config is not None:
@@ -203,8 +230,10 @@ if __name__ == "__main__":
         # config cannot be none during training
         config = {}  # will be filled with default values
 
-    if args.save_path is not None:
-        args.save_path = args.save_path.resolve()
+    if args.save_path is None:
+        args.save_path = Path(".")
+
+    args.save_path = args.save_path.resolve()
 
     output_path = (
         args.output_path
@@ -213,7 +242,11 @@ if __name__ == "__main__":
     )
     if args.predict:
         inference(
-            args.data, args.save_path, index_file=args.index, output_path=output_path
+            args.data,
+            args.save_path,
+            index_file=args.index,
+            output_path=output_path,
+            make_pmfs=args.gen_pmfs,
         )
     elif args.test:
         inference(

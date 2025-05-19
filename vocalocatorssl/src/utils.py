@@ -12,8 +12,8 @@ from .dataloaders import build_dataloaders, build_inference_dataset
 from .location_embed import (
     FourierEmbedding,
     LocationEmbedding,
-    MixedEmbedding,
     MLPEmbedding,
+    PolynomialFourier,
 )
 from .scorers import CosineSimilarityScorer, MLPScorer, Scorer
 
@@ -294,8 +294,8 @@ def initialize_location_embedding(config: dict) -> LocationEmbedding:
         emb = FourierEmbedding(**config["location_embedding_params"])
     elif emb_type == "mlp":
         emb = MLPEmbedding(**config["location_embedding_params"])
-    elif emb_type == "mixed":
-        emb = MixedEmbedding(**config["location_embedding_params"])
+    elif emb_type == "poly-fourier":
+        emb = PolynomialFourier(**config["location_embedding_params"])
     else:
         raise ValueError(f"Unrecognized location embedding type {emb_type}")
 
@@ -467,8 +467,53 @@ def point_in_conf_set(
     # Reshape the result to match the batch size
     result = result.reshape(*batch_size)
     return result
-    # Check if the point is in the confidence set
-    result = conf_set[angle_idx, y_bin, x_bin]  # (n_pts,)
-    # Reshape the result to match the batch size
-    result = result.reshape(*batch_size)
-    return result
+
+
+def compute_test_accuracy(
+    labels: np.ndarray,
+    scores: np.ndarray,
+    arena_dims: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Computes the accuracy of the model at different distances.
+
+    Args:
+        labels (np.ndarray): Labels. Shape (n_samples, n_negative + 1, n_nodes, n_dims)
+        scores (np.ndarray): Scores. Shape (n_samples, n_negative + 1)
+        arena_dims (np.ndarray): Arena dimensions. Shape (3,)
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: Distances and accuracies
+    """
+    # Drop the z dimension and the head node
+    labels = labels[..., 0, :2]  # (B, 1 + n_negative, 2)
+    # Convert to cm
+    scale_factor = arena_dims.max() / 2 / 10
+    labels *= scale_factor
+
+    positive_labels = labels[:, 0]  # (B, 2)
+    positive_scores = scores[:, 0]  # (B, )
+    negative_labels = labels[:, 1:]  # (B, n_negative, 2)
+    negative_scores = scores[:, 1:]  # (B, n_negative)
+
+    # Distance between each positive label and its corresponding negative labels
+    pos_to_neg_dist = np.linalg.norm(
+        positive_labels[:, None, :] - negative_labels, axis=-1
+    )  # (B, n_negative)
+    # If this is a True, the negative label is correctly rejected
+    assignment = negative_scores < positive_scores[:, None]  # (B, n_negative).
+
+    pos_to_neg_dist = pos_to_neg_dist.reshape(-1)  # (B * n_negative, )
+    assignment = assignment.reshape(-1)  # (B * n_negative, )
+
+    # Bin according to distances
+    distance_bins = np.linspace(0, 40, 41, endpoint=True)
+    bin_indices = np.digitize(pos_to_neg_dist, distance_bins) - 1  # (B * n_negative, )
+
+    # Compute the accuracy for each bin
+    bin_acc = np.zeros((len(distance_bins) - 1), dtype=float)
+    for j in range(len(distance_bins) - 1):
+        bin_mask = bin_indices == j
+        bin_acc[j] = assignment[bin_mask].mean() if np.any(bin_mask) else 0.0
+
+    bin_centers = (distance_bins[:-1] + distance_bins[1:]) / 2
+    return bin_centers, bin_acc

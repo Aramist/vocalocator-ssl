@@ -105,6 +105,7 @@ class FourierEmbedding(LocationEmbedding):
         Returns:
             torch.Tensor: (*batch, d_embedding) tensor of embeddings
         """
+        locations = locations.clone()
         if self.multinode_strategy == "relative":
             # Make all nodes except the first node relative to the first
             locations[..., 1:, :] -= locations[..., :1, :]
@@ -181,6 +182,7 @@ class MLPEmbedding(LocationEmbedding):
         Returns:
             torch.Tensor: (*batch, d_embedding) tensor of embeddings
         """
+        locations = locations.clone()
         if self.multinode_strategy == "relative":
             # Make all nodes except the first node relative to the first
             locations[..., 1:, :] -= locations[..., :1, :]
@@ -197,7 +199,7 @@ class MLPEmbedding(LocationEmbedding):
         return embed
 
 
-class MixedEmbedding(LocationEmbedding):
+class PolynomialFourier(LocationEmbedding):
     def __init__(
         self,
         d_location: int,
@@ -217,7 +219,7 @@ class MixedEmbedding(LocationEmbedding):
             d_embedding (int): Dimensionality of the output embedding
         """
         # The multinode strategy is not actually used in this class
-        super(MixedEmbedding, self).__init__(
+        super(PolynomialFourier, self).__init__(
             d_location, d_embedding, multinode_strategy="absolute"
         )
         self.k = xy_poly_degree
@@ -288,6 +290,6 @@ class MixedEmbedding(LocationEmbedding):
 if __name__ == "__main__":
     # Test the MixedEmbedding class
     locations = torch.randn(10, 2, 3)  # 10 samples, 2 nodes, 3 dimensions
-    embedding = MixedEmbedding(d_location=3, d_embedding=128)
+    embedding = PolynomialFourier(d_location=3, d_embedding=128)
     output = embedding(locations)
     print(output.shape)  # Should be (10, 128)

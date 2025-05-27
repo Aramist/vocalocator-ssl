@@ -1,11 +1,11 @@
-from typing import Any
+import typing as tp
 
 import lightning as L
 import numpy as np
 import torch
+from pytorch_lightning.utilities.model_summary.model_summary import ModelSummary
 from torch import optim
 from torchmetrics.classification import MulticlassAccuracy
-from tqdm import trange
 
 from . import utils
 
@@ -13,7 +13,7 @@ from . import utils
 def info_nce(
     logits: torch.Tensor,
     labels: torch.Tensor,
-    temperature: float = 1.0,
+    temperature: float | torch.Tensor = 1.0,
 ):
     logits = logits / temperature
     return torch.logsumexp(logits, dim=1).mean(dim=0) - logits.gather(
@@ -82,7 +82,14 @@ class LVocalocator(L.LightningModule):
                     lora_alpha=self.config["finetune"]["lora_alpha"],
                     lora_dropout=0.0,  # Not implemented yet
                 )
-            print(self)
+            elif ft_config["method"] == "last_layers":
+                print("Attempting to freeze all but the last layers of the model")
+                num_layers = ft_config["num_last_layers"]
+                self.audio_encoder.last_layer_finetunify(num_layers)
+                self.location_encoder.requires_grad_(False)
+                self.scorer.requires_grad_(False)
+            # reprint the model to show the new number of trainable parameters
+            print(str(ModelSummary(self)))
 
     def forward(
         self, audio: torch.Tensor, labels: torch.Tensor, shuffle: bool = True
@@ -131,7 +138,9 @@ class LVocalocator(L.LightningModule):
 
         return or_scores, positive_label_idx
 
-    def training_step(self, batch: dict[str, torch.Tensor], *args: Any) -> torch.Tensor:
+    def training_step(
+        self, batch: dict[str, torch.Tensor], *args: tp.Any
+    ) -> torch.Tensor:
         """Executes a single iteration of the training loop and returns the
         (scalar) loss.
 
@@ -154,7 +163,7 @@ class LVocalocator(L.LightningModule):
         return loss
 
     def validation_step(
-        self, batch: dict[str, torch.Tensor], *args: Any
+        self, batch: dict[str, torch.Tensor], *args: tp.Any
     ) -> torch.Tensor:
         """Exectues a step of the validation pass and returns classification accuracy.
         Implementing this separately from the train_step to return accuracy.
@@ -182,7 +191,7 @@ class LVocalocator(L.LightningModule):
         print(f"Starting prediction with temperature: {self.compute_temperature():.2f}")
 
     def predict_step(
-        self, batch: dict[str, torch.Tensor], *args: Any
+        self, batch: dict[str, torch.Tensor], *args: tp.Any
     ) -> (
         tuple[torch.Tensor, torch.Tensor]
         | tuple[torch.Tensor, torch.Tensor, torch.Tensor]

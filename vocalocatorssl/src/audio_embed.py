@@ -118,6 +118,20 @@ class AudioEmbedder(nn.Module):
             "AudioEmbedder.LORAfy must be implemented by subclasses"
         )
 
+    def last_layer_finetunify(self, num_layers: int):
+        """Freezes all but the last k layers of the model.
+
+        Args:
+            num_layers (int): Number of layers to keep trainable. If num_layers is negative,
+                the last num_layers + k layers will be trainable.
+
+        Raises:
+            ValueError: If num_layers is zero
+        """
+        raise NotImplementedError(
+            "AudioEmbedder.last_layer_finetunify must be implemented by subclasses"
+        )
+
 
 class SimpleNet(AudioEmbedder):
     def __init__(
@@ -196,6 +210,25 @@ class SimpleNet(AudioEmbedder):
         for layer in self.conv_layers.children():
             if isinstance(layer, VocalocatorSimpleLayer):
                 layer.LoRAfy(lora_rank, lora_alpha)
+
+    def last_layer_finetunify(self, num_layers: int):
+        """Freezes all but the last k layers of the model.
+
+        Args:
+            num_layers (int): Number of layers to keep trainable. If num_layers is negative,
+                the last num_layers + k layers will be trainable.
+
+        Raises:
+            ValueError: If num_layers is zero
+        """
+        if num_layers == 0:
+            raise ValueError("num_layers must be non-zero")
+        conv_layers = list(self.conv_layers.children())
+        if num_layers < 0:
+            num_layers += len(conv_layers)
+
+        for layer in conv_layers[:-num_layers]:
+            layer.requires_grad_(False)
 
     def embed_audio(self, audio: torch.Tensor) -> torch.Tensor:
         h1 = self.conv_layers(audio)
@@ -278,3 +311,23 @@ class ResnetConformer(AudioEmbedder):
         for layer in self.conformer.conformer_layers:
             layer.self_attn = LORA_MHA(layer.self_attn, lora_rank, lora_alpha)
             layer.self_attn.requires_grad_(True)
+
+    def last_layer_finetunify(self, num_layers: int):
+        """Freezes all but the last k layers of the model.
+
+        Args:
+            num_layers (int): Number of layers to keep trainable. If num_layers is negative,
+                the last num_layers + k layers will be trainable.
+
+        Raises:
+            ValueError: If num_layers is zero
+        """
+        if num_layers == 0:
+            raise ValueError("num_layers must be non-zero")
+        conformer_layers = self.conformer.conformer_layers
+        if num_layers < 0:
+            num_layers += len(conformer_layers)
+
+        self.resnet.requires_grad_(False)
+        for layer in conformer_layers[:-num_layers]:
+            layer.requires_grad_(False)

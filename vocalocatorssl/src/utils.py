@@ -79,7 +79,8 @@ def get_default_config() -> dict:
             "learning_rate": 1e-3,  # If None, will use the learning rate from the standard config
             "momentum": 0.9,
             "num_weight_updates": 100_000,  # Max num weight updates
-            "method": "none",  # none, lora
+            "method": "none",  # none, lora, last_layers
+            "num_last_layers": 1,  # If method is last_layers, how many layers to finetune
             "lora_rank": 8,
             "lora_alpha": 16,
             "lora_dropout": 0.1,

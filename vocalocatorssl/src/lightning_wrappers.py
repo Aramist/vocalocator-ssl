@@ -351,7 +351,7 @@ class LVocalocator(L.LightningModule):
             scores = torch.zeros(
                 (num_theta * num_phi * num_z * num_xy * num_xy,), dtype=torch.float64
             )
-            for batch_start in trange(0, len(scores), batch_size):
+            for batch_start in range(0, len(scores), batch_size):
                 batch_end = min(batch_start + batch_size, len(scores))
                 loc_batch = location_embeddings[batch_start:batch_end].cuda()
                 scores[batch_start:batch_end] = (

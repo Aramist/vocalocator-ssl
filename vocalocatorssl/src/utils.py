@@ -76,7 +76,7 @@ def get_default_config() -> dict:
             "num_samples_per_vocalization": 200,
         },
         "finetune": {
-            "learning_rate": 1e-3,  # If None, will use the learning rate from the standard config
+            "initial_learning_rate": 1e-3,  # If None, will use the learning rate from the standard config
             "momentum": 0.9,
             "num_weight_updates": 100_000,  # Max num weight updates
             "method": "none",  # none, lora, last_layers
@@ -161,7 +161,7 @@ def initialize_optimizer(
 
     learning_rate = config["optimization"]["initial_learning_rate"]
     if is_finetuning:
-        learning_rate = config["finetune"].get("learning_rate", learning_rate)
+        learning_rate = config["finetune"].get("initial_learning_rate", learning_rate)
 
     opt = base_class(
         params,

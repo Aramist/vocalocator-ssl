@@ -381,7 +381,9 @@ class LVocalocator(L.LightningModule):
     def configure_optimizers(self):
         """Configures the optimizer and learning rate scheduler for a simple reduce-on-plateau
         setup."""
-        optimizer = utils.initialize_optimizer(self.config, self.parameters())
+        optimizer = utils.initialize_optimizer(
+            self.config, self.parameters(), is_finetuning=self.is_finetuning
+        )
         sched = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer=optimizer, patience=20, factor=0.5, mode="min"
         )

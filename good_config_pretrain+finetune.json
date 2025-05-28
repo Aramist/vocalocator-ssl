@@ -1,0 +1,77 @@
+{
+    "optimization": {
+        "num_weight_updates": 1000000,
+        "optimizer": "sgd",
+        "momentum": 0.8,
+        "weight_decay": 0,
+        "clip_gradients": true,
+        "initial_learning_rate": 8e-3,
+        "initial_temperature": 1.0,
+        "final_temperature": 0.025,
+        "num_temperature_steps": 100000
+    },
+    "architecture": "conformer",
+    "model_params": {
+        "d_embedding": 128,
+        "conformer_num_layers": 16,
+        "num_channels": 24
+    },
+    "location_embedding_type": "poly-fourier",
+    "location_embedding_params": {
+        "d_embedding": 256,
+        "xy_poly_degree": 9,
+        "z_poly_degree": 2,
+        "angle_fourier_degree": 64,
+        "d_hidden": 256,
+        "num_layers": 2,
+        "multinode_strategy": "relative",
+        "init_bandwidth": 0.3
+    },
+    "score_function_type": "mlp",
+    "score_function_params": {
+        "d_hidden": 128,
+        "num_layers": 2
+    },
+    "dataloader": {
+        "num_microphones": 24,
+        "crop_length": 8192,
+        "arena_dims": [
+            615,
+            615,
+            425
+        ],
+        "arena_dims_units": "mm",
+        "normalize_data": true,
+        "nodes_to_load": [
+            "Nose",
+            "Head"
+        ],
+        "num_negative_samples": 19,
+        "num_val_negative_samples": 19,
+        "min_difficulty": null,
+        "max_difficulty": null,
+        "num_difficulty_steps": null
+    },
+    "augmentations": {
+        "should_use_augmentations": true,
+        "mask_temporal_prob": 0.5,
+        "mask_temporal_min_length": 915,
+        "mask_temporal_max_length": 3953,
+        "mask_channels_prob": 0.25,
+        "mask_channels_min_channels": 3,
+        "mask_channels_max_channels": 6,
+        "noise_injection_prob": 0.5,
+        "noise_injection_snr_min": 3.530698061861244,
+        "noise_injection_snr_max": 14.817122459314996
+    },
+    "evaluation": {
+        "num_samples_per_vocalization": 200
+    },
+    "finetune": {
+        "initial_learning_rate": 1e-4,
+        "momentum": 0.85,
+        "num_weight_updates": 50000,
+        "method": "last_layers",
+        "num_last_layers": 2
+    }
+}

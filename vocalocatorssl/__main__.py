@@ -158,9 +158,18 @@ def inference(
 
     newest_checkpoint = find_latest_checkpoint(save_directory)
 
-    model = LVocalocator.load_from_checkpoint(
-        newest_checkpoint, strict=False, config=config
-    )
+    try:
+        # Attempt with strict first to see if LoRA was used
+        model = LVocalocator.load_from_checkpoint(
+            newest_checkpoint, strict=True, config=config
+        )
+    except RuntimeError:
+        # Lora was probably used, load without strict and then finetunify
+        model = LVocalocator.load_from_checkpoint(
+            newest_checkpoint, strict=False, config=config, is_finetuning=True
+        )
+        model.finetunify()
+
     dloader = utilsmodule.initialize_inference_dataloader(
         model.config, data_path, index_file, test_mode=test_mode
     )

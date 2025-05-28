@@ -67,27 +67,30 @@ class LVocalocator(L.LightningModule):
         temp = initial_temp + ((final_temp - initial_temp) * cur_step / num_steps)
         return temp
 
+    def finetunify(self) -> None:
+        ft_config = self.config["finetune"]
+        if "lora_rank" not in ft_config or "lora_alpha" not in ft_config:
+            raise ValueError(
+                "LoRA rank and alpha must be specified in the finetuning config"
+            )
+        if ft_config["method"] == "lora":
+            print("Attempting to LoRAfy the model")
+            self.audio_encoder.LoRAfy(
+                lora_rank=self.config["finetune"]["lora_rank"],
+                lora_alpha=self.config["finetune"]["lora_alpha"],
+                lora_dropout=0.0,  # Not implemented yet
+            )
+        elif ft_config["method"] == "last_layers":
+            print("Attempting to freeze all but the last layers of the model")
+            num_layers = ft_config["num_last_layers"]
+            self.audio_encoder.last_layer_finetunify(num_layers)
+            self.location_encoder.requires_grad_(False)
+            self.scorer.requires_grad_(False)
+
     def on_train_start(self) -> None:
         """Override to modify the model for finetuning if necessary."""
         if self.is_finetuning:
-            ft_config = self.config["finetune"]
-            if "lora_rank" not in ft_config or "lora_alpha" not in ft_config:
-                raise ValueError(
-                    "LoRA rank and alpha must be specified in the finetuning config"
-                )
-            if ft_config["method"] == "lora":
-                print("Attempting to LoRAfy the model")
-                self.audio_encoder.LoRAfy(
-                    lora_rank=self.config["finetune"]["lora_rank"],
-                    lora_alpha=self.config["finetune"]["lora_alpha"],
-                    lora_dropout=0.0,  # Not implemented yet
-                )
-            elif ft_config["method"] == "last_layers":
-                print("Attempting to freeze all but the last layers of the model")
-                num_layers = ft_config["num_last_layers"]
-                self.audio_encoder.last_layer_finetunify(num_layers)
-                self.location_encoder.requires_grad_(False)
-                self.scorer.requires_grad_(False)
+            self.finetunify()
             # reprint the model to show the new number of trainable parameters
             print(str(ModelSummary(self)))
 

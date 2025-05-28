@@ -12,8 +12,7 @@
     },
     "architecture": "conformer",
     "model_params": {
-        "d_embedding": 256,
-        "num_channels": 24
+        "d_embedding": 256
     },
     "location_embedding_type": "fourier",
     "location_embedding_params": {

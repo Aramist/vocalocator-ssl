@@ -13,8 +13,7 @@
     "architecture": "conformer",
     "model_params": {
         "d_embedding": 128,
-        "conformer_num_layers": 16,
-        "num_channels": 24
+        "conformer_num_layers": 16
     },
     "location_embedding_type": "poly-fourier",
     "location_embedding_params": {

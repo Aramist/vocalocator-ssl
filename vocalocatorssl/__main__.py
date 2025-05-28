@@ -202,11 +202,13 @@ def inference(
         )
 
         with open(save_directory / "test_accuracy.txt", "w") as ctx:
-            print("Distance (cm)\tAccuracy (%)")
-            ctx.write("Distance (cm)\tAccuracy (%)\n")
+            header = "Distance (cm),Accuracy (%)"
+            print(header)
+            ctx.write(header + "\n")
             for dist, acc in zip(dist_bins, accs):
-                print(f"{float(dist):.1f}\t{float(acc):.1%}")
-                ctx.write(f"{float(dist):.1f}\t{float(acc):.1%}\n")
+                line = f"{float(dist):.1f},{float(acc):.3f}"
+                print(line)
+                ctx.write(line + "\n")
 
 
 if __name__ == "__main__":

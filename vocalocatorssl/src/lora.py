@@ -259,6 +259,7 @@ class LORA_MHA(nn.Module):
         self.register_buffer("cached_K", None, persistent=False)
 
         self.initialize_params()
+        self.to(mod.in_proj_weight.device)
 
     def initialize_params(self):
         nn.init.xavier_normal_(self.q_lora_A)

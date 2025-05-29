@@ -302,7 +302,6 @@ class LORA_MHA(nn.Module):
         Returns:
             nn.Module: self
         """
-        print(f"called train({mode}) on LORA_MHA")
         if mode:
             self.cached_Q = None
             self.cached_K = None

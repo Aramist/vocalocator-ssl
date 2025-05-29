@@ -234,29 +234,31 @@ class LORA_MHA(nn.Module):
         if self.Q is not None:
             q_out_size, q_in_size = self.Q.shape
             k_out_size, k_in_size = self.K.shape
-            # v_out_size, v_in_size = self.V.shape
+            v_out_size, v_in_size = self.V.shape
         else:
             out_size, in_size = self.in_proj_weight.shape
-            # q_out_size = k_out_size = v_out_size = out_size // 3
-            # q_in_size = k_in_size = v_in_size = in_size
-            q_out_size = k_out_size = out_size // 3
-            q_in_size = k_in_size = in_size
+            q_out_size = k_out_size = v_out_size = out_size // 3
+            q_in_size = k_in_size = v_in_size = in_size
+            # q_out_size = k_out_size = out_size // 3
+            # q_in_size = k_in_size = in_size
 
         q_lora_A = torch.empty((self.rank, q_in_size), dtype=self.dtype)
         q_lora_B = torch.empty((q_out_size, self.rank), dtype=self.dtype)
-        k_lora_A = torch.empty((self.rank, k_in_size), dtype=self.dtype)
-        k_lora_B = torch.empty((k_out_size, self.rank), dtype=self.dtype)
-        # The original LoRA paper finds that updating the V matrix doesn't yield significant benefits
-        # v_lora_A = torch.empty((self.rank, v_in_size), dtype=self.V.dtype)
-        # v_lora_B = torch.empty((v_out_size, self.rank), dtype=self.V.dtype)
+        # k_lora_A = torch.empty((self.rank, k_in_size), dtype=self.dtype)
+        # k_lora_B = torch.empty((k_out_size, self.rank), dtype=self.dtype)
+        v_lora_A = torch.empty((self.rank, v_in_size), dtype=self.dtype)
+        v_lora_B = torch.empty((v_out_size, self.rank), dtype=self.dtype)
 
         self.register_parameter("q_lora_A", nn.Parameter(q_lora_A))
         self.register_parameter("q_lora_B", nn.Parameter(q_lora_B))
-        self.register_parameter("k_lora_A", nn.Parameter(k_lora_A))
-        self.register_parameter("k_lora_B", nn.Parameter(k_lora_B))
+        # self.register_parameter("k_lora_A", nn.Parameter(k_lora_A))
+        # self.register_parameter("k_lora_B", nn.Parameter(k_lora_B))
+        self.register_parameter("v_lora_A", nn.Parameter(v_lora_A))
+        self.register_parameter("v_lora_B", nn.Parameter(v_lora_B))
 
         self.register_buffer("cached_Q", None, persistent=False)
-        self.register_buffer("cached_K", None, persistent=False)
+        # self.register_buffer("cached_K", None, persistent=False)
+        self.register_buffer("cached_V", None, persistent=False)
 
         self.initialize_params()
         self.to(mod.in_proj_weight.device)
@@ -264,10 +266,14 @@ class LORA_MHA(nn.Module):
     def initialize_params(self):
         nn.init.xavier_normal_(self.q_lora_A)
         nn.init.zeros_(self.q_lora_B)
-        nn.init.xavier_normal_(self.k_lora_A)
-        nn.init.zeros_(self.k_lora_B)
 
-    def _make_QK(self) -> tp.Tuple[Tensor, Tensor]:
+        # nn.init.xavier_normal_(self.k_lora_A)
+        # nn.init.zeros_(self.k_lora_B)
+
+        nn.init.xavier_normal_(self.v_lora_A)
+        nn.init.zeros_(self.v_lora_B)
+
+    def _make_QKV(self) -> tp.Tuple[Tensor, Tensor, Tensor]:
         """Creates an adapted Q and K matrix based on the current low rank weight
         matrices. The matrices are scaled proportionally to the inverse of the module's rank
         to allow for consistency in learning rate across different choices of the rank
@@ -275,14 +281,15 @@ class LORA_MHA(nn.Module):
         """
 
         if self.Q is None:
-            Q, K, _ = torch.chunk(self.in_proj_weight, 3, dim=0)
+            Q, _, V = torch.chunk(self.in_proj_weight, 3, dim=0)
         else:
-            Q, K = self.Q, self.K
+            Q, _, V = self.Q, self.K, self.V
 
         # Q = BA + Q_old
         Q = torch.addmm(Q, self.q_lora_B, self.q_lora_A, alpha=self.scale)
-        K = torch.addmm(K, self.k_lora_B, self.k_lora_A, alpha=self.scale)
-        return Q, K
+        # K = torch.addmm(K, self.k_lora_B, self.k_lora_A, alpha=self.scale)
+        V = torch.addmm(V, self.v_lora_B, self.v_lora_A, alpha=self.scale)
+        return Q, None, V
 
     def train(self, mode: bool = True) -> nn.Module:
         """If entering eval mode, creates cached Q and K matrices which will be reused
@@ -295,12 +302,17 @@ class LORA_MHA(nn.Module):
         Returns:
             nn.Module: self
         """
-
+        print(f"called train({mode}) on LORA_MHA")
         if mode:
             self.cached_Q = None
             self.cached_K = None
+            self.cached_V = None
         else:
-            self.cached_Q, self.cached_K = self._make_QK()
+            cached_Q, _, cached_V = self._make_QKV()
+            self.cached_Q = cached_Q.detach()
+            # self.cached_K = torch.nn.Buffer(cached_K, persistent=False)
+            self.cached_V = cached_V.detach()
+
         return super().train(mode)
 
     def eval(self) -> nn.Module:
@@ -326,16 +338,17 @@ class LORA_MHA(nn.Module):
 
         is_batched = query.dim() == 3
 
-        if self.cached_Q is not None:
+        if not self.training:
             Q = self.cached_Q
-            K = self.cached_K
+            # K = self.cached_K
+            V = self.cached_V
         else:
-            Q, K = self._make_QK()
+            Q, _, V = self._make_QKV()
 
-        if self.V is None:
-            _, _, V = torch.chunk(self.in_proj_weight, 3, dim=0)
+        if self.K is None:
+            _, K, _ = torch.chunk(self.in_proj_weight, 3, dim=0)
         else:
-            V = self.V
+            K = self.K
 
         if is_batched and self.batch_first:
             Q = Q.transpose(0, 1)

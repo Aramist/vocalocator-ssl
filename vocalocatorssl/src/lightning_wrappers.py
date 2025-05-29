@@ -73,6 +73,8 @@ class LVocalocator(L.LightningModule):
             raise ValueError(
                 "LoRA rank and alpha must be specified in the finetuning config"
             )
+        self.location_encoder.requires_grad_(False)
+        self.scorer.requires_grad_(False)
         if ft_config["method"] == "lora":
             print("Attempting to LoRAfy the model")
             self.audio_encoder.LoRAfy(
@@ -84,15 +86,11 @@ class LVocalocator(L.LightningModule):
             print("Attempting to freeze all but the last layers of the model")
             num_layers = ft_config["num_last_layers"]
             self.audio_encoder.last_layer_finetunify(num_layers)
-            self.location_encoder.requires_grad_(False)
-            self.scorer.requires_grad_(False)
 
-    def on_train_start(self) -> None:
+    def setup(self, stage) -> None:
         """Override to modify the model for finetuning if necessary."""
         if self.is_finetuning:
             self.finetunify()
-            # reprint the model to show the new number of trainable parameters
-            print(str(ModelSummary(self)))
 
     def forward(
         self, audio: torch.Tensor, labels: torch.Tensor, shuffle: bool = True
@@ -161,7 +159,13 @@ class LVocalocator(L.LightningModule):
         loss = info_nce(scores, positive_label_index, temperature=temperature)
 
         self.minibatch_idx += 1
-        self.log("infonce_temperature", temperature, on_step=True, sync_dist=False)
+        self.log(
+            "infonce_temperature",
+            temperature,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=False,
+        )
         self.log("train_loss", loss, on_epoch=True, on_step=False, sync_dist=False)
         return loss
 
@@ -385,7 +389,9 @@ class LVocalocator(L.LightningModule):
         """Configures the optimizer and learning rate scheduler for a simple reduce-on-plateau
         setup."""
         optimizer = utils.initialize_optimizer(
-            self.config, self.parameters(), is_finetuning=self.is_finetuning
+            self.config,
+            filter(lambda p: p.requires_grad, self.parameters()),
+            is_finetuning=self.is_finetuning,
         )
         sched = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer=optimizer, patience=20, factor=0.5, mode="min"

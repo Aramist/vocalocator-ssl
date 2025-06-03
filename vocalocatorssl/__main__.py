@@ -164,11 +164,15 @@ def inference(
             newest_checkpoint, strict=True, config=config
         )
     except RuntimeError:
-        # Lora was probably used, load without strict and then finetunify
+        # Lora was probably used, load without strict to get hparams and then finetunify
         model = LVocalocator.load_from_checkpoint(
             newest_checkpoint, strict=False, config=config, is_finetuning=True
         )
         model.finetunify()
+        model.load_state_dict(
+            torch.load(newest_checkpoint, map_location="cpu")["state_dict"],
+            strict=True,
+        )
 
     dloader = utilsmodule.initialize_inference_dataloader(
         model.config, data_path, index_file, test_mode=test_mode

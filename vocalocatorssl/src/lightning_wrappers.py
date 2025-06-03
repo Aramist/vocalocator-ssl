@@ -33,6 +33,7 @@ class LVocalocator(L.LightningModule):
         self.save_hyperparameters()
         self.config = config
         self.is_finetuning = is_finetuning
+        self.has_finetunified = False
 
         self.audio_encoder = utils.initialize_audio_embedder(config)
         self.location_encoder = utils.initialize_location_embedding(config)
@@ -68,13 +69,16 @@ class LVocalocator(L.LightningModule):
         return temp
 
     def finetunify(self) -> None:
+        if self.has_finetunified:
+            return
+
         ft_config = self.config["finetune"]
         if "lora_rank" not in ft_config or "lora_alpha" not in ft_config:
             raise ValueError(
                 "LoRA rank and alpha must be specified in the finetuning config"
             )
-        self.location_encoder.requires_grad_(False)
-        self.scorer.requires_grad_(False)
+        # self.location_encoder.requires_grad_(False)
+        # self.scorer.requires_grad_(False)
         if ft_config["method"] == "lora":
             print("Attempting to LoRAfy the model")
             self.audio_encoder.LoRAfy(
@@ -86,6 +90,7 @@ class LVocalocator(L.LightningModule):
             print("Attempting to freeze all but the last layers of the model")
             num_layers = ft_config["num_last_layers"]
             self.audio_encoder.last_layer_finetunify(num_layers)
+        self.has_finetunified = True
 
     def setup(self, stage) -> None:
         """Override to modify the model for finetuning if necessary."""

@@ -28,7 +28,10 @@ def sample_pairwise_distances(pts: np.ndarray, num_samples=1000) -> np.ndarray:
 
     # Sample random points from the dataset
     rng = np.random.default_rng(42)
-    sample_indices = rng.choice(len(pts), num_samples, replace=False)
+    if num_samples < len(pts):
+        sample_indices = rng.choice(len(pts), num_samples, replace=False)
+    else:
+        sample_indices = np.arange(len(pts))
     pts = pts[sample_indices, :]
 
     magsqr = np.sum(pts**2, axis=1)  # (n_samples,)

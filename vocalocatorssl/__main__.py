@@ -223,6 +223,17 @@ def inference(
                 print(line)
                 ctx.write(line + "\n")
 
+        # Compute and report confidence
+        cal_bins, calibration_curve = utilsmodule.compute_test_calibration(scores)
+        with open(save_directory / "test_calibration.txt", "w") as ctx:
+            header = "bin_left,accuracy"
+            print(header)
+            ctx.write(header + "\n")
+            for bin_left, acc in zip(cal_bins, calibration_curve):
+                line = f"{float(bin_left):.3f},{float(acc):.3f}"
+                print(line)
+                ctx.write(line + "\n")
+
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()

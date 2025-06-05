@@ -518,3 +518,41 @@ def compute_test_accuracy(
 
     bin_centers = (distance_bins[:-1] + distance_bins[1:]) / 2
     return bin_centers, bin_acc
+
+
+def compute_test_calibration(
+    scores: np.ndarray,
+    num_bins: int = 20,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Computes the calibration curve for the model on a dataset with known speaker identity.
+
+    Args:
+        scores (np.ndarray): Array of shape (batch, 1 + num_negative_samples) containing the scores for each sample.
+            The first entry is expected to be the score of the positive sample, and the remaining entries are the scores
+            of the negative samples for the same vocalization.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: Confidence bin left edges and the corresponding accuracies
+    """
+    pos_scores = scores[:, 0]  # (B, )
+    neg_scores = scores[:, 1:]  # (B, n_negative)
+
+    num_negative = neg_scores.shape[1]
+    pos_scores = pos_scores.repeat(num_negative, axis=0)  # (B * n_negative, )
+    neg_scores = neg_scores.reshape(-1)  # (B * n_negative, )
+
+    pos_neg_probs = np.stack([pos_scores, neg_scores], axis=1)  # (B * n_negative, 2)
+    pos_neg_probs = numpy_softmax(pos_neg_probs, axis=1)
+
+    Y_hat = pos_neg_probs.argmax(axis=1)
+    P_hat = pos_neg_probs.max(axis=1)
+
+    p_bins = np.linspace(0.5, 1.0, num_bins + 1, endpoint=True)
+    bin_indices = np.digitize(P_hat, p_bins) - 1  # (B * n_negative, )
+    bin_acc = np.zeros((num_bins,), dtype=float)
+    for j in range(num_bins):
+        bin_mask = bin_indices == j
+        bin_acc[j] = (Y_hat[bin_mask] == 0).mean() if np.any(bin_mask) else 0.0
+
+    bin_l = p_bins[:-1]
+    return bin_l, bin_acc

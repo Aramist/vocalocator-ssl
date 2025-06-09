@@ -554,5 +554,5 @@ def compute_test_calibration(
         bin_mask = bin_indices == j
         bin_acc[j] = (Y_hat[bin_mask] == 0).mean() if np.any(bin_mask) else 0.0
 
-    bin_l = p_bins[:-1]
-    return bin_l, bin_acc
+    bin_center = 0.5 * (p_bins[:-1] + p_bins[1:])  # (num_bins, )
+    return bin_center, bin_acc

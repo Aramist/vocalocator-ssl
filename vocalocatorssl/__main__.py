@@ -226,7 +226,7 @@ def inference(
         # Compute and report confidence
         cal_bins, calibration_curve = utilsmodule.compute_test_calibration(scores)
         with open(save_directory / "test_calibration.txt", "w") as ctx:
-            header = "bin_left,accuracy"
+            header = "bin_center,accuracy"
             print(header)
             ctx.write(header + "\n")
             for bin_left, acc in zip(cal_bins, calibration_curve):

@@ -576,11 +576,9 @@ def build_dataloaders(
         full_index = np.arange(dset_size)
         rng = np.random.default_rng(0)
         rng.shuffle(full_index)
-        data_split_indices["train"] = full_index[: int(0.8 * dset_size)]
-        data_split_indices["val"] = full_index[
-            int(0.8 * dset_size) : int(0.9 * dset_size)
-        ]
-        data_split_indices["test"] = full_index[int(0.9 * dset_size) :]
+        data_split_indices["train"] = full_index[: int(0.9 * dset_size)]
+        data_split_indices["val"] = full_index[int(0.9 * dset_size) :]
+        data_split_indices["test"] = None
 
     training_dataset = VocalizationDataset(
         train_path,

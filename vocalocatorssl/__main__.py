@@ -47,7 +47,7 @@ def make_trainer(config: dict, save_directory: Path, **kwargs) -> L.Trainer:
                 verbose=False,
             ),
             # End training if validation accuracy does not improve for 40 epochs
-            callbacks.EarlyStopping(monitor="val_acc", mode="max", patience=40),
+            callbacks.EarlyStopping(monitor="val_acc", mode="max", patience=100),
             # End training if weights explode
             callbacks.EarlyStopping(
                 monitor="train_loss", check_finite=True, verbose=False, patience=1000

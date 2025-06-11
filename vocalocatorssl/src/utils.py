@@ -31,6 +31,7 @@ def get_default_config() -> dict:
             "initial_temperature": 1.0,
             "final_temperature": 0.1,
             "num_temperature_steps": 100_000,
+            "temperature_schedule": "linear",  # linear, exponential
         },
         # Valid architectures: simplenet, conformer
         "architecture": "simplenet",

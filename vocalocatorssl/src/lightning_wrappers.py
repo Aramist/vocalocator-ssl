@@ -64,8 +64,9 @@ class LVocalocator(L.LightningModule):
             self.config["optimization"]["initial_temperature"],
             self.config["optimization"]["final_temperature"],
         )
-        linear_schedule = self.config["optimization"].get(
-            "temperature_schedule", "exponential"
+        linear_schedule = (
+            self.config["optimization"].get("temperature_schedule", "exponential")
+            == "linear"
         )
         cur_step = torch.clamp(self.minibatch_idx, min=0, max=num_steps)
         if linear_schedule:

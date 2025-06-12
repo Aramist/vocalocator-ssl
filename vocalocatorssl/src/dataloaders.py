@@ -59,7 +59,142 @@ def collate(batch) -> dict[str, torch.Tensor]:
     return {"audio": audio, "labels": labels}
 
 
-class VocalizationDataset(Dataset):
+class DifficultySampler(torch.utils.data.Sampler):
+    def __init__(
+        self,
+        lengths: list[int],
+        num_animals: list[int],
+        batch_size: int,
+        *,
+        difficulty_range: Optional[tuple[float, float]] = None,
+        num_difficulty_steps: Optional[int] = None,
+        shuffle: bool = True,
+        seed: int = 1,
+    ):
+        """A sampler which samples with increasing difficulty (optionally) and ensures that samples in the same batch
+        contain the same number of animals.
+
+        Args:
+            lengths (list[int]): Length of each dataset.
+            num_animals (list[int]): Number of animals in each dataset.
+            difficulty_range (Optional[tuple[float, float]], optional): Minimum and maximum sampling difficulty. If None, no difficulty sampling is performed.
+            num_difficulty_steps (Optional[int], optional): Number of difficulty steps to sample from. If None, no difficulty sampling is performed.
+            shuffle (bool, optional): Whether to shuffle the dataset. Defaults to True.
+            seed (int, optional): Random seed for reproducibility. Defaults to 1.
+        """
+        super().__init__()
+        self.lengths = lengths
+        self.num_animals = num_animals
+        self.batch_size = batch_size
+        self.shuffle: bool = shuffle
+        self.difficulty_range: Optional[tuple[float, float]] = difficulty_range
+        self.num_difficulty_steps: Optional[int] = num_difficulty_steps
+        self.cur_difficulty_step: int = 0
+        self.difficulty_step_increment = 1
+        self.rng = np.random.default_rng(seed)
+
+    @property
+    def difficulty(self) -> float | None:
+        """Returns the current difficulty level, which is a value between 0 and 1."""
+        if self.difficulty_range is None or self.num_difficulty_steps is None:
+            return None
+
+        return self.cur_difficulty_step / self.num_difficulty_steps
+
+    def step_difficulty(self):
+        if self.num_difficulty_steps is None:
+            return
+
+        self.cur_difficulty_step = min(
+            self.cur_difficulty_step + self.difficulty_step_increment,
+            self.num_difficulty_steps,
+        )
+
+    def sample_difficulty(self) -> float | None:
+        """From the current difficulty level, sample a difficulty index from the beta distribution.
+
+        Returns:
+            float: Sampled difficulty index between 0 and 1
+        """
+        if self.difficulty_range is None or self.difficulty is None:
+            return None
+
+        min_d, max_d = self.difficulty_range
+        cur_difficulty = (
+            self.difficulty * (max_d - min_d) + min_d
+        )  # float between min and max difficulty
+        beta = 10**cur_difficulty
+        alpha = (
+            1 / beta
+        )  # Smaller values of cur_difficulty yield samples of the beta distribution
+        # closer to zero, which corresponds to early (low spread) indices in the sorting
+        # index
+        sample = self.rng.beta(alpha, beta, 1).item()  # Sampled value between 0 and 1
+        return sample
+
+    def __len__(self) -> int:
+        return int(sum(self.lengths) // self.batch_size)
+
+    def __iter__(self) -> tp.Iterator[list[tuple[int, int, float | None]]]:
+        """Batched iterator for sampling indices with the same number of animals.
+
+        Returns:
+            tp.Iterator[list[tuple[int, float | None]]]: Iterator over minibatches of dataset indices,
+            data indices, and difficulty levels.
+        """
+        num_animals = np.unique(self.num_animals)
+        indices_by_num_animals = {n_a: [] for n_a in num_animals}
+        for i, (n_animals_in_dset, dset_length) in enumerate(
+            zip(self.num_animals, self.lengths)
+        ):
+            idx_for_dset = [(i, j) for j in range(dset_length)]
+            indices_by_num_animals[n_animals_in_dset].extend(idx_for_dset)
+
+        if not self.shuffle:
+            for idx_set in indices_by_num_animals.values():
+                i = 0
+                while i < len(idx_set):
+                    diff = self.sample_difficulty()
+                    end_idx = min(i + self.batch_size, len(idx_set))
+                    yield [
+                        (*dset_and_data_idx, diff)
+                        for dset_and_data_idx in idx_set[i:end_idx]
+                    ]
+                    i += self.batch_size
+                    self.step_difficulty()
+            return
+
+        # Shuffle within each group of indices
+        for idx_set in indices_by_num_animals.values():
+            self.rng.shuffle(idx_set)
+
+        while any(indices_by_num_animals.values()):
+            # Sample a number of animals
+            valid_num_animals = [
+                n_a for n_a, idx_set in indices_by_num_animals.items() if idx_set
+            ]
+            num_animals_to_sample = self.rng.choice(valid_num_animals)
+            end_idx = min(
+                self.batch_size, len(indices_by_num_animals[num_animals_to_sample])
+            )
+            dset_and_data_indices = indices_by_num_animals[num_animals_to_sample][
+                :end_idx
+            ]
+            indices_by_num_animals[num_animals_to_sample] = indices_by_num_animals[
+                num_animals_to_sample
+            ][end_idx:]  # Chop off the part we sampled from
+            if len(dset_and_data_indices) < self.batch_size:
+                # If we don't have enough indices, drop the batch
+                continue
+            diff = self.sample_difficulty()
+            yield [
+                (*dset_and_data_idx, diff)
+                for dset_and_data_idx in dset_and_data_indices
+            ]
+            self.step_difficulty()
+
+
+class SingleVocalizationDataset(Dataset):
     def __init__(
         self,
         dataset_path: Union[Path, str],
@@ -117,6 +252,7 @@ class VocalizationDataset(Dataset):
         self.length: int = len(self.index)
         self.inverse_index = {v: k for k, v in enumerate(self.index)}
         self.rng: np.random.Generator
+        self.num_animals: int = dataset["locations"].shape[1]
 
         # Determine which nodes indices to select
         if nodes is None:
@@ -136,6 +272,10 @@ class VocalizationDataset(Dataset):
             self.node_indices = np.array(self.node_indices)
 
         multi_animal = len(dataset["locations"].shape) > 3
+        if not multi_animal:
+            raise ValueError(
+                "This dataset contains a single animal, but does not contain a singleton dimension for the animal. Please ensure the dataset is formatted correctly."
+            )
         if construct_search_tree:  # only needed for training
             # Expected shape: (dataset_size, n_animals, n_nodes, n_dims)
             animal_configurations: np.ndarray = dataset["locations"][
@@ -306,7 +446,7 @@ class VocalizationDataset(Dataset):
             return torch.empty((0, n_animals, n_nodes, n_dims))
         if difficulty is None:
             choices = np.delete(self.index, self.inverse_index[idx])
-            neg_idx = self.rng.choice(choices, size=n, replace=False)
+            neg_idx = self.rng.choice(choices, size=n, replace=True)
             return torch.stack([self.__label_for_index(i) for i in neg_idx], dim=0)
 
         search_radius = self.pairwise_distance_quantiles[
@@ -440,75 +580,68 @@ class VocalizationDataset(Dataset):
         return sound, locations
 
 
-class DifficultySampler(torch.utils.data.Sampler):
-    def __init__(
-        self,
-        dataset: VocalizationDataset,
-        *,
-        difficulty_range: Optional[tuple[float, float]] = None,
-        num_difficulty_steps: Optional[int] = None,
-        shuffle: bool = True,
-        seed: int = 1,
-    ):
-        super().__init__()
-        self.length: int = len(dataset)
-        self.shuffle: bool = shuffle
-        self.difficulty_range: Optional[tuple[float, float]] = difficulty_range
-        self.num_difficulty_steps: Optional[int] = num_difficulty_steps
-        self.cur_difficulty_step: int = 0
-        self.difficulty_step_increment = 1
-        self.rng = np.random.default_rng(seed)
+class PluralVocalizationDataset(Dataset):
+    def __init__(self, datasets: list[SingleVocalizationDataset]):
+        """A dataset that combines multiple SingleVocalizationDatasets into a single dataset.
 
-    @property
-    def difficulty(self) -> Optional[float]:
-        """Returns the current difficulty level, which is a value between 0 and 1."""
-        if self.difficulty_range is None:
-            return None
-
-        return self.cur_difficulty_step / self.num_difficulty_steps
-
-    def step_difficulty(self):
-        if self.num_difficulty_steps is None:
-            return
-
-        self.cur_difficulty_step = min(
-            self.cur_difficulty_step + self.difficulty_step_increment,
-            self.num_difficulty_steps,
-        )
-
-    def sample_difficulty(self) -> float:
-        """From the current difficulty level, sample a difficulty index from the beta distribution.
-
-        Returns:
-            float: Sampled difficulty index between 0 and 1
+        Args:
+            datasets (list[SingleVocalizationDataset]): List of SingleVocalizationDataset objects to combine.
         """
-        if self.difficulty_range is None:
-            return None
+        self.datasets = datasets
+        self.lengths = [len(d) for d in datasets]
+        self.length = sum(self.lengths)
+        self.num_animals = [d.num_animals for d in datasets]
 
-        min_d, max_d = self.difficulty_range
-        cur_difficulty = (
-            self.difficulty * (max_d - min_d) + min_d
-        )  # float between min and max difficulty
-        beta = 10**cur_difficulty
-        alpha = (
-            1 / beta
-        )  # Smaller values of cur_difficulty yield samples of the beta distribution
-        # closer to zero, which corresponds to early (low spread) indices in the sorting
-        # index
-        sample = self.rng.beta(alpha, beta, 1).item()  # Sampled value between 0 and 1
-        return sample
+        self.indices = {
+            d.datapath.stem: d.index for d in self.datasets
+        }  # used externally
 
-    def __len__(self) -> int:
+    def __len__(self):
         return self.length
 
-    def __iter__(self) -> tp.Iterator[tuple[int, Optional[float]]]:
-        shuffled_idx = np.arange(self.length)
-        if self.shuffle:
-            self.rng.shuffle(shuffled_idx)
+    def __getitem__(
+        self, args: tuple[int, int, float | None]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gets the audio and locations from a given index in the given dataset.
 
-        for i in shuffled_idx:
-            yield i, self.sample_difficulty()
-            self.step_difficulty()
+        Args:
+            args (tuple[int, int, float | None]): A tuple containing the dataset index, the index within that dataset, and the difficulty level.
+                The dataset index is used to select the dataset from self.datasets, and the index within that dataset is used to select the vocalization.
+                The difficulty level is used to sample negative locations.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: Audio and locations
+        """
+        return self.datasets[args[0]][args[1:]]
+
+    def make_sampler(
+        self,
+        batch_size: int = 1,
+        difficulty_range: tuple[float, float] | None = None,
+        num_difficulty_steps: int | None = None,
+        shuffle: bool = True,
+        seed: int = 1,
+    ) -> DifficultySampler:
+        """Creates a sampler for the dataset.
+
+        Args:
+            difficulty_range (tuple[float, float] | None, optional): Range of difficulty levels to sample from. Defaults to None.
+            num_difficulty_steps (int | None, optional): Number of difficulty steps to sample from. Defaults to None.
+            shuffle (bool, optional): Whether to shuffle the dataset. Defaults to True.
+            seed (int, optional): Random seed for reproducibility. Defaults to 1.
+
+        Returns:
+            DifficultySampler: Sampler for the dataset.
+        """
+        return DifficultySampler(
+            self.lengths,
+            self.num_animals,
+            batch_size=batch_size,
+            difficulty_range=difficulty_range,
+            num_difficulty_steps=num_difficulty_steps,
+            shuffle=shuffle,
+            seed=seed,
+        )
 
 
 def get_logical_cores():
@@ -554,24 +687,19 @@ def build_dataloaders(
     Returns:
         tuple[DataLoader, DataLoader, Optional[DataLoader]]: Train, validation, and test dataloaders
     """
-    train_path = dataset_path
-    val_path = dataset_path
-    test_path = dataset_path
-
-    data_split_indices = {"train": None, "val": None, "test": None}
-    if index_dir_path is not None:
-        train_idx_path = index_dir_path / "train_set.npy"
-        val_idx_path = index_dir_path / "val_set.npy"
-        test_idx_path = index_dir_path / "test_set.npy"
-        if not all([train_idx_path.exists(), val_idx_path.exists()]):
-            raise ValueError("Index arrays must exist for both train and val sets")
-        data_split_indices["train"] = np.load(train_idx_path)
-        data_split_indices["val"] = np.load(val_idx_path)
-        if test_idx_path.exists():
-            data_split_indices["test"] = np.load(test_idx_path)
+    if dataset_path.is_dir():
+        cand_paths = list(dataset_path.glob("*.h5"))
     else:
+        cand_paths = [dataset_path]
+
+    training_datasets = []
+    validation_datasets = []
+    for cand_path in cand_paths:
+        data_split_indices = {"train": None, "val": None}
+        train_path = cand_path
+        val_path = cand_path
         # manually create train/val split
-        with h5py.File(train_path, "r") as f:
+        with h5py.File(cand_path, "r") as f:
             if "length_idx" in f:
                 dset_size = len(f["length_idx"]) - 1
             else:
@@ -581,31 +709,36 @@ def build_dataloaders(
         rng.shuffle(full_index)
         data_split_indices["train"] = full_index[: int(0.9 * dset_size)]
         data_split_indices["val"] = full_index[int(0.9 * dset_size) :]
-        data_split_indices["test"] = None
 
-    training_dataset = VocalizationDataset(
-        train_path,
-        arena_dims=arena_dims,
-        crop_length=crop_length,
-        num_negative_samples=num_negative_samples,
-        index=data_split_indices["train"],
-        normalize_data=normalize_data,
-        nodes=node_names,
-    )
+        training_dataset = SingleVocalizationDataset(
+            train_path,
+            arena_dims=arena_dims,
+            crop_length=crop_length,
+            num_negative_samples=num_negative_samples,
+            index=data_split_indices["train"],
+            normalize_data=normalize_data,
+            nodes=node_names,
+        )
 
-    validation_dataset = VocalizationDataset(
-        val_path,
-        arena_dims=arena_dims,
-        crop_length=crop_length,
-        num_negative_samples=num_negative_samples
-        if num_val_negative_samples is None
-        else num_val_negative_samples,
-        crop_randomly=True,
-        index=data_split_indices["val"],
-        normalize_data=normalize_data,
-        nodes=node_names,
-        construct_search_tree=False,
-    )
+        validation_dataset = SingleVocalizationDataset(
+            val_path,
+            arena_dims=arena_dims,
+            crop_length=crop_length,
+            num_negative_samples=num_negative_samples
+            if num_val_negative_samples is None
+            else num_val_negative_samples,
+            crop_randomly=True,
+            index=data_split_indices["val"],
+            normalize_data=normalize_data,
+            nodes=node_names,
+            construct_search_tree=False,
+        )
+
+        training_datasets.append(training_dataset)
+        validation_datasets.append(validation_dataset)
+
+    combined_training_dataset = PluralVocalizationDataset(training_datasets)
+    combined_validation_dataset = PluralVocalizationDataset(validation_datasets)
 
     difficulty_range = (
         None
@@ -617,13 +750,12 @@ def build_dataloaders(
     )
     avail_cpus = get_logical_cores()
     train_dataloader = DataLoader(
-        training_dataset,
-        batch_size=batch_size,
+        combined_training_dataset,
         num_workers=avail_cpus,
         collate_fn=collate,
         pin_memory=True,
-        sampler=DifficultySampler(
-            training_dataset,
+        batch_sampler=combined_training_dataset.make_sampler(
+            batch_size=batch_size,
             difficulty_range=difficulty_range,
             num_difficulty_steps=train_difficulty_steps,
             shuffle=True,
@@ -632,42 +764,20 @@ def build_dataloaders(
     )
 
     val_dataloader = DataLoader(
-        validation_dataset,
-        batch_size=batch_size,
+        combined_validation_dataset,
         collate_fn=collate,
         num_workers=avail_cpus,
         pin_memory=True,
-        sampler=DifficultySampler(
-            validation_dataset,
+        batch_sampler=combined_validation_dataset.make_sampler(
+            batch_size=batch_size,
+            difficulty_range=difficulty_range,
+            num_difficulty_steps=num_difficulty_steps,
             shuffle=False,
             seed=sampler_seed,
         ),
     )
 
-    test_dataloader = None
-    if test_path.exists():
-        testdata = VocalizationDataset(
-            test_path,
-            arena_dims=arena_dims,
-            crop_length=crop_length,
-            crop_randomly=True,
-            index=data_split_indices["test"],
-            normalize_data=normalize_data,
-            construct_search_tree=False,
-        )
-        test_dataloader = DataLoader(
-            testdata,
-            batch_size=batch_size,
-            collate_fn=collate,
-            sampler=DifficultySampler(
-                testdata,
-                difficulty_range=None,
-                num_difficulty_steps=None,
-                shuffle=False,
-            ),
-        )
-
-    return train_dataloader, val_dataloader, test_dataloader
+    return train_dataloader, val_dataloader, None
 
 
 def build_inference_dataset(
@@ -701,7 +811,7 @@ def build_inference_dataset(
     else:
         indices = None
 
-    inference_dataset = VocalizationDataset(
+    inference_dataset = SingleVocalizationDataset(
         dataset_path,
         arena_dims=arena_dims,
         crop_length=crop_length,
@@ -713,13 +823,14 @@ def build_inference_dataset(
         construct_search_tree=False,
     )
 
+    inference_dataset = PluralVocalizationDataset([inference_dataset])
+
     loader = DataLoader(
         inference_dataset,
-        batch_size=batch_size,
         num_workers=get_logical_cores(),
         collate_fn=collate,
-        sampler=DifficultySampler(
-            inference_dataset,
+        batch_sampler=inference_dataset.make_sampler(
+            batch_size=batch_size,
             difficulty_range=None,
             num_difficulty_steps=None,
             shuffle=False,

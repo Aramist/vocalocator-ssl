@@ -92,10 +92,10 @@ def train_default(
         if index_dir is None:
             index_dir = save_directory / "indices"
             index_dir.mkdir(exist_ok=True)
-            np.save(index_dir / "train_set.npy", train_dloader.dataset.index)
-            np.save(index_dir / "val_set.npy", val_dloader.dataset.index)
+            np.savez(index_dir / "train_set.npz", **train_dloader.dataset.indices)
+            np.savez(index_dir / "val_set.npz", **val_dloader.dataset.indices)
             if test_dloader is not None:
-                np.save(index_dir / "test_set.npy", test_dloader.dataset.index)
+                np.savez(index_dir / "test_set.npz", **test_dloader.dataset.indices)
 
         # Save config
         with open(save_directory / "config.json", "w") as ctx:

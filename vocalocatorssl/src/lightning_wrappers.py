@@ -3,8 +3,8 @@ import typing as tp
 import lightning as L
 import numpy as np
 import torch
-from pytorch_lightning.utilities.model_summary.model_summary import ModelSummary
 from torch import optim
+from torch.nn import functional as F
 from torchmetrics.classification import MulticlassAccuracy
 
 from . import utils
@@ -108,7 +108,7 @@ class LVocalocator(L.LightningModule):
 
     def forward(
         self, audio: torch.Tensor, labels: torch.Tensor, shuffle: bool = True
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Computes scores between audio and labels.
 
         Args:
@@ -151,7 +151,12 @@ class LVocalocator(L.LightningModule):
         or_scores = torch.logsumexp(scores, dim=-1)
         # Shape: (batch, 1 + num_negative)
 
-        return or_scores, positive_label_idx
+        positive_scores = scores[torch.arange(bsz), positive_label_idx, :]
+        score_spread = (
+            torch.max(positive_scores, dim=-1).values
+            - torch.min(positive_scores, dim=-1).values
+        )
+        return or_scores, score_spread, positive_label_idx
 
     def training_step(
         self, batch: dict[str, torch.Tensor], *args: tp.Any
@@ -168,9 +173,13 @@ class LVocalocator(L.LightningModule):
         audio, labels = batch["audio"], batch["labels"]
         audio = self.augmentation_transform(audio)
 
-        scores, positive_label_index = self.forward(audio, labels)
+        scores, score_spread, positive_label_index = self.forward(audio, labels)
         temperature = self.compute_temperature()
-        loss = info_nce(scores, positive_label_index, temperature=temperature)
+        contrastive_loss = info_nce(
+            scores, positive_label_index, temperature=temperature
+        )
+        # Encourages the score spread to be supra-threshold
+        dispersion_loss = F.relu(np.log(100) - (score_spread / temperature).mean())
 
         self.minibatch_idx += 1
         self.log(
@@ -180,8 +189,28 @@ class LVocalocator(L.LightningModule):
             on_epoch=True,
             sync_dist=False,
         )
-        self.log("train_loss", loss, on_epoch=True, on_step=False, sync_dist=False)
-        return loss
+        self.log(
+            "contrastive_loss",
+            contrastive_loss,
+            on_epoch=True,
+            on_step=False,
+            sync_dist=False,
+        )
+        self.log(
+            "dispersion_loss",
+            dispersion_loss,
+            on_epoch=True,
+            on_step=False,
+            sync_dist=False,
+        )
+        self.log(
+            "train_loss",
+            contrastive_loss + dispersion_loss,
+            on_epoch=True,
+            on_step=False,
+            sync_dist=False,
+        )
+        return contrastive_loss + dispersion_loss
 
     def validation_step(
         self, batch: dict[str, torch.Tensor], *args: tp.Any
@@ -198,14 +227,29 @@ class LVocalocator(L.LightningModule):
         audio, labels = batch["audio"], batch["labels"]
 
         # Shuffled to prevent weight explosion from inflating accuracy
-        scores, positive_label_index = self.forward(audio, labels, shuffle=True)
+        scores, diffs, positive_label_index = self.forward(audio, labels, shuffle=True)
         # pred: (batch, )
         metric = MulticlassAccuracy(num_classes=scores.shape[1], average="micro").to(
             labels.device
         )
         acc = metric(scores, positive_label_index)
 
+        prop_assignable = (
+            (diffs / self.compute_temperature() > np.log(20))
+            .to(torch.float)
+            .mean()
+            .item()
+        )
+
         self.log("val_acc", acc, on_epoch=True, sync_dist=True, on_step=False)
+        self.log(
+            "val_prop_assignable",
+            prop_assignable,
+            on_epoch=True,
+            sync_dist=True,
+            on_step=False,
+            batch_size=len(audio),
+        )
         return acc
 
     def on_predict_start(self):
@@ -297,8 +341,8 @@ class LVocalocator(L.LightningModule):
         theta_max = 2 * np.pi
         phi_min = np.pi / 2 - 0.1
         phi_max = np.pi / 2
-        xy_min = -1.1
-        xy_max = 1.1
+        xy_min = -1.0
+        xy_max = 1.0
         z_min = 0.05
         z_max = 0.2
 
@@ -409,7 +453,7 @@ class LVocalocator(L.LightningModule):
             is_finetuning=self.is_finetuning,
         )
         sched = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer=optimizer, patience=20, factor=0.5, mode="min"
+            optimizer=optimizer, patience=50, factor=0.5, mode="min"
         )
 
         return {

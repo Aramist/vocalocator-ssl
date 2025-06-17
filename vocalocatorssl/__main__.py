@@ -210,18 +210,21 @@ def inference(
 
     if test_mode:
         # Compute and report accuracy
-        dist_bins, accs = utilsmodule.compute_test_accuracy(
-            labels, scores, dloader.dataset.arena_dims
-        )
+        # labels should have shape (N, num_negative+1, num_animals, num_nodes, num_dimensions)
+        if labels.shape[-3] == 1:
+            # If we have ground truth labels, we can compute accuracy
+            dist_bins, accs = utilsmodule.compute_test_accuracy(
+                labels, scores, dloader.dataset.arena_dims
+            )
 
-        with open(save_directory / "test_accuracy.txt", "w") as ctx:
-            header = "Distance (cm),Accuracy (%)"
-            print(header)
-            ctx.write(header + "\n")
-            for dist, acc in zip(dist_bins, accs):
-                line = f"{float(dist):.1f},{float(acc):.3f}"
-                print(line)
-                ctx.write(line + "\n")
+            with open(save_directory / "test_accuracy.txt", "w") as ctx:
+                header = "Distance (cm),Accuracy (%)"
+                print(header)
+                ctx.write(header + "\n")
+                for dist, acc in zip(dist_bins, accs):
+                    line = f"{float(dist):.1f},{float(acc):.3f}"
+                    print(line)
+                    ctx.write(line + "\n")
 
         # Compute and report confidence
         cal_bins, calibration_curve = utilsmodule.compute_test_calibration(scores)

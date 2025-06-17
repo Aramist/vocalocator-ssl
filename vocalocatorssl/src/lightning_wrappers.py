@@ -236,9 +236,7 @@ class LVocalocator(L.LightningModule):
         if len(labels.shape) == 4:
             labels = labels.unsqueeze(0)  # Create batch dim
 
-        if self.flags["predict_test_mode"]:
-            labels = labels.squeeze(2)  # Assume only one animal per label
-        else:
+        if not self.flags["predict_test_mode"]:
             labels = labels.squeeze(1)  # Assume no negatives
 
         audio_embeddings = self.audio_encoder(audio)  # (b, feats)
@@ -251,6 +249,9 @@ class LVocalocator(L.LightningModule):
         scores = self.scorer(audio_embeddings, location_embeddings)  # (b, n_animals)
         # Ensure the same temperature used during training is applied at inference time
         scores = scores / self.compute_temperature()
+
+        if self.flags["predict_test_mode"]:
+            scores = torch.logsumexp(scores, dim=-1)  # sum over animals
 
         if self.flags["predict_gen_pmfs"]:
             # Generate PMFs for each animal

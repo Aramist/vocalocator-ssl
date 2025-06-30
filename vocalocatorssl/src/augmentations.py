@@ -70,15 +70,15 @@ class Identity(Augmentation):
 
 class TemporalMask(Augmentation):
     def __init__(
-        self, prob: float, *, min_length: int, max_length: int, use_noise: bool
+        self, prob: float, *, min_length: float, max_length: float, use_noise: bool
     ):
         """Replaces a random interval of all channels of the input with zeros or white noise.
         Does not mutate the input tensor in place.
 
         Args:
             prob (float): Probability of applying the augmentation to each member of a batch.
-            min_length (int): Minimum length of the masked interval in samples.
-            max_length (int): Maximum length of the masked interval in samples.
+            min_length (float): Minimum length of the masked interval as a fraction of the audio length.
+            max_length (float): Maximum length of the masked interval as a fraction of the audio length.
             use_noise (bool): If True, the masked interval is filled with white noise. Otherwise, it is filled with zeros.
 
         Raises:
@@ -110,11 +110,15 @@ class TemporalMask(Augmentation):
             )
 
         audio = audio.clone()
+        min_length, max_length = (
+            int(self.min_length * audio.shape[1]),
+            int(self.max_length * audio.shape[1]),
+        )
 
         for i, mask in enumerate(batch_mask):
             if mask:
-                start_idx = np.random.randint(0, audio.shape[1] - self.min_length)
-                length = np.random.randint(self.min_length, self.max_length + 1)
+                start_idx = np.random.randint(0, audio.shape[1] - min_length)
+                length = np.random.randint(min_length, max_length + 1)
                 end_idx = min(start_idx + length, audio.shape[1])
                 if self.use_noise:
                     noise_mag = torch.std(audio[i, start_idx:end_idx, :])

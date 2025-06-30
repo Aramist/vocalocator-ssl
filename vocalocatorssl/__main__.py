@@ -10,6 +10,7 @@ import torch
 from lightning.pytorch import callbacks
 
 from .src import utils as utilsmodule
+from .src.dataloaders import VocalizationDataset
 from .src.lightning_wrappers import LVocalocator
 from .src.utils import load_json
 
@@ -46,19 +47,12 @@ def make_trainer(config: dict, save_directory: Path, **kwargs) -> L.Trainer:
                 save_last=True,
                 verbose=False,
             ),
-            # End training if validation accuracy does not improve for 40 epochs
+            # End training if validation accuracy does not improve
             callbacks.EarlyStopping(monitor="val_acc", mode="max", patience=100),
             # End training if weights explode
             callbacks.EarlyStopping(
                 monitor="train_loss", check_finite=True, verbose=False, patience=1000
             ),
-            # End training if learning rate gets too low
-            # callbacks.EarlyStopping(
-            #     monitor="lr-SGD",
-            #     mode="min",
-            #     patience=100000000,
-            #     stopping_threshold=1e-6,
-            # ),
             # Log learning rates
             callbacks.LearningRateMonitor(logging_interval="epoch"),
         ],
@@ -201,12 +195,42 @@ def inference(
     labels = torch.cat(labels, dim=0).cpu().numpy()
     scores = torch.cat(scores, dim=0).cpu().numpy()
 
+    # For convenience, copy the session file names into the output
+    if index_file is not None:
+        index = np.load(index_file)
+    else:
+        index = np.arange(len(scores))
+    __dset: VocalizationDataset = dloader.dataset
+    # Trigger the dataset to regenerate the h5py link
+    _ = __dset[(0, None)]
+    if "orig_file" in __dset.dataset and "orig_filenames" in __dset.dataset:
+        session_idx = __dset.dataset["orig_file"][:][index]  # (num_vocalizations, ) int
+        session_names = __dset.dataset["orig_filenames"][
+            :
+        ]  # (num_sessions, ) bytestrings
+    else:
+        session_idx = None
+        session_names = None
+
     if make_pmfs:
         pmfs = [x[2] for x in preds]
         pmfs = torch.cat(pmfs, dim=0).cpu().numpy()
-        np.savez(output_path, labels=labels, scores=scores, pmfs=pmfs)
+        np.savez(
+            output_path,
+            labels=labels,
+            scores=scores,
+            pmfs=pmfs,
+            session_idx=session_idx,
+            session_names=session_names,
+        )
     else:
-        np.savez(output_path, labels=labels, scores=scores)
+        np.savez(
+            output_path,
+            labels=labels,
+            scores=scores,
+            session_idx=session_idx,
+            session_names=session_names,
+        )
 
     if test_mode:
         # Compute and report accuracy

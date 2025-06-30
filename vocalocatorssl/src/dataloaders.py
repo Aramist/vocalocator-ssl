@@ -133,7 +133,7 @@ class DifficultySampler(torch.utils.data.Sampler):
         return sample
 
     def __len__(self) -> int:
-        return int(sum(self.lengths) // self.batch_size)
+        return sum([int(l // self.batch_size) for l in self.lengths])
 
     def __iter__(self) -> tp.Iterator[list[tuple[int, int, float | None]]]:
         """Batched iterator for sampling indices with the same number of animals.

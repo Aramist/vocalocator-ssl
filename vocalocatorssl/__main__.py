@@ -46,19 +46,12 @@ def make_trainer(config: dict, save_directory: Path, **kwargs) -> L.Trainer:
                 save_last=True,
                 verbose=False,
             ),
-            # End training if validation accuracy does not improve for 40 epochs
+            # End training if validation accuracy does not improve
             callbacks.EarlyStopping(monitor="val_acc", mode="max", patience=100),
             # End training if weights explode
             callbacks.EarlyStopping(
                 monitor="train_loss", check_finite=True, verbose=False, patience=1000
             ),
-            # End training if learning rate gets too low
-            # callbacks.EarlyStopping(
-            #     monitor="lr-SGD",
-            #     mode="min",
-            #     patience=100000000,
-            #     stopping_threshold=1e-6,
-            # ),
             # Log learning rates
             callbacks.LearningRateMonitor(logging_interval="epoch"),
         ],
@@ -111,6 +104,7 @@ def train_default(
         )
     else:
         model = LVocalocator(config)
+
     trainer.fit(model, train_dloader, val_dloader)
 
     if trainer.global_rank == 0:

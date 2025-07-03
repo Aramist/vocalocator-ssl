@@ -10,6 +10,7 @@ import torch
 from lightning.pytorch import callbacks
 
 from .src import utils as utilsmodule
+from .src.dataloaders import PluralVocalizationDataset
 from .src.lightning_wrappers import LVocalocator
 from .src.utils import load_json
 
@@ -189,39 +190,53 @@ def inference(
         )
     )
 
-    labels = [x[0] for x in preds]
-    scores = [x[1] for x in preds]
+    labels = [x[0].cpu().numpy() for x in preds]
+    scores = [x[1].cpu().numpy() for x in preds]
 
-    labels = torch.cat(labels, dim=0).cpu().numpy()
-    scores = torch.cat(scores, dim=0).cpu().numpy()
+    dset: PluralVocalizationDataset = dloader.dataset
+    filenames = dset.filenames
+    dset_lengths = dset.lengths
+
+    # Concatenate predictions and labels within each dataset
+    labels_by_dataset = []
+    scores_by_dataset = []
+    for length in dset_lengths:
+        accum_labels = []
+        accum_scores = []
+        breakpoint()
+        while sum(len(arr) for arr in accum_labels) < length:
+            # Get the next batch of labels
+            accum_labels.append(labels.pop(0))
+            accum_scores.append(scores.pop(0))
+        labels_by_dataset.append(np.concatenate(accum_labels, axis=0))
+        scores_by_dataset.append(np.concatenate(accum_scores, axis=0))
+
+    labels = {
+        f"{dataset_name}-labels": labels
+        for dataset_name, labels in zip(filenames, labels_by_dataset)
+    }
+    scores = {
+        f"{dataset_name}-scores": scores
+        for dataset_name, scores in zip(filenames, scores_by_dataset)
+    }
 
     if make_pmfs:
         pmfs = [x[2] for x in preds]
-        pmfs = torch.cat(pmfs, dim=0).cpu().numpy()
-        np.savez(output_path, labels=labels, scores=scores, pmfs=pmfs)
+        pmfs = torch.cat(pmfs, dim=0).cpu().numpy()  # These all have the same shape
+        np.savez(output_path, pmfs=pmfs, **labels, **scores)
     else:
-        np.savez(output_path, labels=labels, scores=scores)
+        np.savez(output_path, **labels, **scores)
 
     if test_mode:
-        # Compute and report accuracy
-        # labels should have shape (N, num_negative+1, num_animals, num_nodes, num_dimensions)
-        if labels.shape[-3] == 1:
-            # If we have ground truth labels, we can compute accuracy
-            dist_bins, accs = utilsmodule.compute_test_accuracy(
-                labels, scores, dloader.dataset.arena_dims
-            )
-
-            with open(save_directory / "test_accuracy.txt", "w") as ctx:
-                header = "Distance (cm),Accuracy (%)"
-                print(header)
-                ctx.write(header + "\n")
-                for dist, acc in zip(dist_bins, accs):
-                    line = f"{float(dist):.1f},{float(acc):.3f}"
-                    print(line)
-                    ctx.write(line + "\n")
-
         # Compute and report confidence
-        cal_bins, calibration_curve = utilsmodule.compute_test_calibration(scores)
+        # in test mode the num_animal dimensions is reduced out
+        # scores should have shape (N, num_negative + 1)
+        scores_concat = np.concatenate(
+            [scores[f"{dataset_name}-scores"] for dataset_name in filenames], axis=0
+        )
+        cal_bins, calibration_curve = utilsmodule.compute_test_calibration(
+            scores_concat
+        )
         with open(save_directory / "test_calibration.txt", "w") as ctx:
             header = "bin_center,accuracy"
             print(header)

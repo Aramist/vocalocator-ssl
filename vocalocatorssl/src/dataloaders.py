@@ -9,6 +9,7 @@ from typing import Optional, Tuple, Union
 
 import h5py
 import numpy as np
+import numpy.lib.npyio
 import torch
 from scipy.spatial import KDTree
 from torch.nn import functional as F
@@ -133,7 +134,11 @@ class DifficultySampler(torch.utils.data.Sampler):
         return sample
 
     def __len__(self) -> int:
-        return sum([int(l // self.batch_size) for l in self.lengths])
+        if self.shuffle:
+            # Shorter batches will be skipped in this setting
+            return sum([int(l // self.batch_size) for l in self.lengths])
+        else:
+            return sum([int(np.ceil(l / self.batch_size)) for l in self.lengths])
 
     def __iter__(self) -> tp.Iterator[list[tuple[int, int, float | None]]]:
         """Batched iterator for sampling indices with the same number of animals.
@@ -142,20 +147,15 @@ class DifficultySampler(torch.utils.data.Sampler):
             tp.Iterator[list[tuple[int, float | None]]]: Iterator over minibatches of dataset indices,
             data indices, and difficulty levels.
         """
-        num_animals = np.unique(self.num_animals)
-        indices_by_num_animals = {n_a: [] for n_a in num_animals}
-        for i, (n_animals_in_dset, dset_length) in enumerate(
-            zip(self.num_animals, self.lengths)
-        ):
-            idx_for_dset = [(i, j) for j in range(dset_length)]
-            indices_by_num_animals[n_animals_in_dset].extend(idx_for_dset)
 
         if not self.shuffle:
-            for idx_set in indices_by_num_animals.values():
+            # Return indices in the same order the datasets were passed in
+            for dataset_idx, dset_length in enumerate(self.lengths):
+                idx_set = [(dataset_idx, i) for i in range(dset_length)]
                 i = 0
-                while i < len(idx_set):
+                while i < dset_length:
                     diff = self.sample_difficulty()
-                    end_idx = min(i + self.batch_size, len(idx_set))
+                    end_idx = min(i + self.batch_size, dset_length)
                     yield [
                         (*dset_and_data_idx, diff)
                         for dset_and_data_idx in idx_set[i:end_idx]
@@ -164,6 +164,13 @@ class DifficultySampler(torch.utils.data.Sampler):
                     self.step_difficulty()
             return
 
+        num_animals = np.unique(self.num_animals)
+        indices_by_num_animals = {n_a: [] for n_a in num_animals}
+        for i, (n_animals_in_dset, dset_length) in enumerate(
+            zip(self.num_animals, self.lengths)
+        ):
+            idx_for_dset = [(i, j) for j in range(dset_length)]
+            indices_by_num_animals[n_animals_in_dset].extend(idx_for_dset)
         # Shuffle within each group of indices
         for idx_set in indices_by_num_animals.values():
             self.rng.shuffle(idx_set)
@@ -596,6 +603,8 @@ class PluralVocalizationDataset(Dataset):
             d.datapath.stem: d.index for d in self.datasets
         }  # used externally
 
+        self.filenames = [d.datapath.stem for d in self.datasets]
+
     def __len__(self):
         return self.length
 
@@ -653,6 +662,68 @@ def get_logical_cores():
         return max(1, os.cpu_count() - 2)
 
 
+def load_indices(
+    index_dir_path: Path | None, dataset_names: list[str]
+) -> list[dict[str, np.ndarray | None]]:
+    """Loads the indices for the datasets from the index directory. Returns as a list of dictionaries
+    with keys "train", "val", and optionally "test". The list length and ordering is the same as dataset_names.
+
+    Args:
+        index_dir_path (Path | None): Path to the directory containing the index files.
+        dataset_names (list[str]): List of dataset names to load indices for.
+
+    Returns:
+        list[dict[str, np.ndarray | None]]: List of dictionaries containing the indices for each dataset.
+    """
+    indices: list[dict[str, np.ndarray | None]] = [
+        {"train": None, "val": None, "test": None} for _ in dataset_names
+    ]
+    if not index_dir_path or not index_dir_path.exists():
+        return indices
+
+    all_train = (
+        index_dir_path / "train_set.npz"
+        if len(dataset_names) > 1
+        else index_dir_path / "train_set.npy"
+    )
+    if all_train.exists():
+        all_train_idx: np.ndarray | numpy.lib.npyio.NpzFile = np.load(all_train)
+        for i, dataset_name in enumerate(dataset_names):
+            indices[i]["train"] = (
+                all_train_idx[dataset_name]
+                if not isinstance(all_train_idx, np.ndarray)
+                else all_train_idx
+            )
+    all_val = (
+        index_dir_path / "val_set.npz"
+        if len(dataset_names) > 1
+        else index_dir_path / "val_set.npy"
+    )
+    if all_val.exists():
+        all_val_idx: np.ndarray | numpy.lib.npyio.NpzFile = np.load(all_val)
+        for i, dataset_name in enumerate(dataset_names):
+            indices[i]["val"] = (
+                all_val_idx[dataset_name]
+                if not isinstance(all_val_idx, np.ndarray)
+                else all_val_idx
+            )
+    all_test = (
+        index_dir_path / "test_set.npz"
+        if len(dataset_names) > 1
+        else index_dir_path / "test_set.npy"
+    )
+    if all_test.exists():
+        all_test_idx: np.ndarray | numpy.lib.npyio.NpzFile = np.load(all_test)
+        for i, dataset_name in enumerate(dataset_names):
+            indices[i]["test"] = (
+                all_test_idx[dataset_name]
+                if not isinstance(all_test_idx, np.ndarray)
+                else all_test_idx
+            )
+
+    return indices
+
+
 def build_dataloaders(
     dataset_path: Path,
     index_dir_path: Optional[Path],
@@ -694,21 +765,27 @@ def build_dataloaders(
 
     training_datasets = []
     validation_datasets = []
-    for cand_path in cand_paths:
-        data_split_indices = {"train": None, "val": None}
+    test_datasets = []
+    indices = load_indices(index_dir_path, [p.stem for p in cand_paths])
+
+    for cand_path, data_split_indices in zip(cand_paths, indices):
         train_path = cand_path
         val_path = cand_path
         # manually create train/val split
-        with h5py.File(cand_path, "r") as f:
-            if "length_idx" in f:
-                dset_size = len(f["length_idx"]) - 1
-            else:
-                raise ValueError("Improperly formatted dataset")
-        full_index = np.arange(dset_size)
-        rng = np.random.default_rng(0)
-        rng.shuffle(full_index)
-        data_split_indices["train"] = full_index[: int(0.9 * dset_size)]
-        data_split_indices["val"] = full_index[int(0.9 * dset_size) :]
+        if data_split_indices["train"] is None or data_split_indices["val"] is None:
+            with h5py.File(cand_path, "r") as f:
+                if "length_idx" in f:
+                    dset_size = len(f["length_idx"]) - 1
+                else:
+                    raise ValueError("Improperly formatted dataset")
+            full_index = np.arange(dset_size)
+            rng = np.random.default_rng(0)
+            rng.shuffle(full_index)
+            data_split_indices["train"] = full_index[: int(0.85 * dset_size)]
+            data_split_indices["val"] = full_index[
+                int(0.85 * dset_size) : int(0.95 * dset_size)
+            ]
+            data_split_indices["test"] = full_index[int(0.95 * dset_size) :]
 
         training_dataset = SingleVocalizationDataset(
             train_path,
@@ -734,11 +811,28 @@ def build_dataloaders(
             construct_search_tree=False,
         )
 
+        # Used to save the test set index for calibration later
+        test_dataset = SingleVocalizationDataset(
+            val_path,
+            arena_dims=arena_dims,
+            crop_length=crop_length,
+            num_negative_samples=num_negative_samples
+            if num_val_negative_samples is None
+            else num_val_negative_samples,
+            crop_randomly=False,
+            index=data_split_indices["test"],
+            normalize_data=normalize_data,
+            nodes=node_names,
+            construct_search_tree=False,
+        )
+
         training_datasets.append(training_dataset)
         validation_datasets.append(validation_dataset)
+        test_datasets.append(test_dataset)
 
     combined_training_dataset = PluralVocalizationDataset(training_datasets)
     combined_validation_dataset = PluralVocalizationDataset(validation_datasets)
+    combined_test_dataset = PluralVocalizationDataset(test_datasets)
 
     difficulty_range = (
         None
@@ -776,8 +870,19 @@ def build_dataloaders(
             seed=sampler_seed,
         ),
     )
+    test_dataloader = DataLoader(
+        combined_test_dataset,
+        collate_fn=collate,
+        batch_sampler=combined_test_dataset.make_sampler(
+            batch_size=batch_size,
+            difficulty_range=None,
+            num_difficulty_steps=None,
+            shuffle=False,
+            seed=sampler_seed,
+        ),
+    )
 
-    return train_dataloader, val_dataloader, None
+    return train_dataloader, val_dataloader, test_dataloader
 
 
 def build_inference_dataset(
@@ -794,7 +899,7 @@ def build_inference_dataset(
     """Constructs a single dataset for performing inference on a dataset.
 
     Args:
-        dataset_path (Path): Path to the dataset. Should be an HDF5 file.
+        dataset_path (Path): Path to the dataset. Should be an HDF5 file or directory of HDF5 files.
         index_path (Optional[Path]): Path to a numpy array of indices for the dataset.
         arena_dims (list[float]): Dimensions of the arena in mm. Used to scale labels.
         batch_size (int): Batch size of the dataloader
@@ -806,24 +911,39 @@ def build_inference_dataset(
         VocalizationDataset: The dataset for inference
     """
 
+    if dataset_path.is_dir():
+        cand_paths = list(dataset_path.glob("*.h5"))
+    else:
+        cand_paths = [dataset_path]
+
     if index_path is not None:
         indices = np.load(index_path)
     else:
         indices = None
 
-    inference_dataset = SingleVocalizationDataset(
-        dataset_path,
-        arena_dims=arena_dims,
-        crop_length=crop_length,
-        crop_randomly=True,  # Todo: Experiment with this
-        index=indices,
-        normalize_data=normalize_data,
-        nodes=node_names,
-        num_negative_samples=num_inference_samples,
-        construct_search_tree=False,
-    )
+    datasets = []
 
-    inference_dataset = PluralVocalizationDataset([inference_dataset])
+    for cand_path in cand_paths:
+        idx = None
+        if indices is not None and len(cand_paths) > 1:
+            idx = indices[cand_path.stem]
+        elif indices is not None:
+            idx = indices
+
+        inference_dataset = SingleVocalizationDataset(
+            cand_path,
+            arena_dims=arena_dims,
+            crop_length=crop_length,
+            crop_randomly=True,  # Todo: Experiment with this
+            index=idx,
+            normalize_data=normalize_data,
+            nodes=node_names,
+            num_negative_samples=num_inference_samples,
+            construct_search_tree=False,
+        )
+        datasets.append(inference_dataset)
+
+    inference_dataset = PluralVocalizationDataset(datasets)
 
     loader = DataLoader(
         inference_dataset,

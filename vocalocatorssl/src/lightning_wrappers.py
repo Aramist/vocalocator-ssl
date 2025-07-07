@@ -42,6 +42,7 @@ class LVocalocator(L.LightningModule):
         self.flags = {
             "predict_test_mode": False,
             "predict_gen_pmfs": False,
+            "temperature_adjustment": 1.0,  # For calibration
         }
 
         self.register_buffer(
@@ -248,7 +249,9 @@ class LVocalocator(L.LightningModule):
 
         scores = self.scorer(audio_embeddings, location_embeddings)  # (b, n_animals)
         # Ensure the same temperature used during training is applied at inference time
-        scores = scores / self.compute_temperature()
+        temp_adjustment = self.flags["temperature_adjustment"]
+
+        scores = scores / (self.compute_temperature() * temp_adjustment)
 
         if self.flags["predict_test_mode"]:
             scores = torch.logsumexp(scores, dim=-1)  # sum over animals
@@ -261,6 +264,148 @@ class LVocalocator(L.LightningModule):
         return labels, scores
 
     def make_pmf(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Computes score distributions for each candidate source location for each
+        sound in the batch.
+
+        Args:
+            batch (dict[str, torch.Tensor]): Batch of audio samples and candidate locations.
+                audio is expected to have shape (batch, time, channels)
+                locations are expected to have shape (batch, num_negative + 1, num_animals, num_nodes, num_dims)
+
+        Returns:
+            torch.Tensor: Normalized probability distributions over arena (batch, num_theta, num_y, num_x)
+        """
+        is_3d = batch["labels"].shape[-1] == 3
+        if is_3d:
+            pmfs = self.make_pmf_3d(batch)
+        else:
+            pmfs = self.make_pmf_2d(batch)
+        return pmfs.reshape(
+            pmfs.shape[0], pmfs.shape[1] * pmfs.shape[2] * pmfs.shape[3]
+        )
+
+    def make_pmf_2d(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Computes score distributions for each candidate source location for each
+        sound in the batch.
+
+        Args:
+            batch (dict[str, torch.Tensor]): Batch of audio samples and candidate locations.
+                audio is expected to have shape (batch, time, channels)
+                locations are expected to have shape (batch, num_negative + 1, num_animals, num_nodes, 2)
+
+        Returns:
+            torch.Tensor: Normalized probability distributions over arena (batch, num_theta, num_y, num_x)
+        """
+        audio = batch["audio"]
+        labels = batch["labels"]
+        if len(audio.shape) == 2:
+            audio = audio.unsqueeze(0)  # Create batch dim
+        if len(labels.shape) == 4:
+            labels = labels.unsqueeze(0)  # Create batch dim
+
+        labels = labels.squeeze(
+            1
+        )  # Assume no negatives  (b, n_animals, n_nodes, n_dims)
+
+        head_to_nose_dist = torch.linalg.norm(
+            labels[..., 0, :] - labels[..., 1, :], axis=-1
+        ).mean()  # (,)
+        # Grid resolution
+        num_theta = 8
+        num_xy = 55
+
+        # Grid size
+        theta_min = 0
+        theta_max = 2 * np.pi
+        xy_min = -1.1
+        xy_max = 1.1
+
+        theta = np.linspace(theta_min, theta_max, num_theta)
+        animal_direction = (
+            np.stack(
+                [np.cos(theta), np.sin(theta)],
+                axis=-1,
+            )
+            * head_to_nose_dist.cpu().item()
+        )  # (n_theta, 2)
+        animal_direction = torch.from_numpy(animal_direction).float().to(labels.device)
+
+        head_location = np.stack(
+            np.meshgrid(
+                np.linspace(xy_min, xy_max, num_xy),
+                np.linspace(xy_min, xy_max, num_xy),
+                indexing="ij",
+            ),  # returns tuple x,y with coords (x,y)
+            axis=-1,
+        ).transpose(1, 0, 2)  # (n_y, n_x, 3)
+        head_location = torch.from_numpy(head_location).float().to(labels.device)
+
+        # Get the nose location grid from the head locations and the animal directions
+        head_location = head_location.reshape(1, num_xy, num_xy, 2)
+        animal_direction = animal_direction.reshape(num_theta, 1, 1, 2)
+        nose_location = head_location + animal_direction  # (n_theta, n_y, n_x, 3)
+
+        head_location = head_location.expand_as(nose_location)
+        animal_pose = torch.stack([nose_location, head_location], dim=-2)
+        # (n_theta, n_y, n_x, 2, 3)
+
+        audio_embeddings = self.audio_encoder(audio)  # (b, feats)
+        # No batch dimension in location_embeddings bc we only need one grid for all the animals
+        # Compute location embeddings in batches to avoid OOM
+        location_embeddings = self.cached_location_embeddings_grid
+        if location_embeddings is None:
+            try:
+                location_embeddings = self.location_encoder(
+                    animal_pose
+                ).cpu()  # (n_theta, n_y, n_x, feats)
+                location_embeddings = location_embeddings.reshape(
+                    -1, location_embeddings.shape[-1]
+                )
+            except RuntimeError as e:
+                print(f"OOM error in computing location embeddings: {e}")
+                print("Attempting to compute in batches...")
+                location_embeddings = torch.empty(
+                    (
+                        num_theta * num_xy * num_xy,
+                        self.location_encoder.d_embedding,
+                    ),
+                    dtype=torch.float32,
+                )
+                flat_pose = animal_pose.reshape(num_theta * num_xy * num_xy, 2, 2)
+                bsize = 2048
+                num_batches = int(np.ceil(location_embeddings.shape[0] / bsize))
+                for i in range(num_batches):
+                    bstart = i * bsize
+                    bend = min((i + 1) * bsize, location_embeddings.shape[0])
+                    location_embeddings[bstart:bend] = self.location_encoder(
+                        flat_pose[bstart:bend].cuda()
+                    ).cpu()
+            self.cached_location_embeddings_grid = location_embeddings
+
+        pmfs = []
+        temp_adjustment = self.flags["temperature_adjustment"]
+        temp = self.compute_temperature().cpu() * temp_adjustment
+        for audio_e in audio_embeddings:
+            batch_size = 512
+            audio_e = audio_e.unsqueeze(0).expand(batch_size, -1)
+            scores = torch.zeros((num_theta * num_xy * num_xy,), dtype=torch.float64)
+            for batch_start in range(0, len(scores), batch_size):
+                batch_end = min(batch_start + batch_size, len(scores))
+                loc_batch = location_embeddings[batch_start:batch_end].cuda()
+                scores[batch_start:batch_end] = (
+                    self.scorer(audio_e[: len(loc_batch)], loc_batch)
+                    .cpu()
+                    .to(torch.float64)
+                    / temp
+                )
+
+            # This part gets expensive
+            scores = torch.softmax(scores, dim=0)
+            scores = scores.reshape(num_theta, num_xy, num_xy)
+            pmfs.append(scores.to(torch.float32))
+        return torch.stack(pmfs)
+
+    def make_pmf_3d(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         """Computes score distributions for each candidate source location for each
         sound in the batch.
 

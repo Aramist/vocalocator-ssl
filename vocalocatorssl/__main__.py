@@ -128,6 +128,7 @@ def inference(
     index_file: tp.Optional[Path] = None,
     test_mode: bool = False,
     make_pmfs: bool = False,
+    temperature_adjustment: float = 1.0,
 ):
     """Runs inference on a dataset using the trained model located at `save_directory`.
 
@@ -139,6 +140,9 @@ def inference(
         output_path (Path): Path to save the predictions.
         test_mode (bool, optional): If False, the model will be used for predicting sound sources. If true
             the model's accuracy at varying distances will be tested on the provided dataset.
+        make_pmfs (bool, optional): If True, the model will generate probability mass functions (PMFs) for each prediction.
+            Defaults to False.
+        temperature_adjustment (float, optional): Temperature adjustment for calibration. Defaults to 1.0.
 
     Raises:
         FileNotFoundError: If the model is not found at `save_directory`.
@@ -181,6 +185,7 @@ def inference(
     make_pmfs = make_pmfs and not test_mode  # Mutually exclusive
     model.flags["predict_test_mode"] = test_mode  # Hack to pass args into predict_step
     model.flags["predict_gen_pmfs"] = make_pmfs
+    model.flags["temperature_adjustment"] = temperature_adjustment
     preds: tp.Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = (
         trainer.predict(
             model,
@@ -203,7 +208,6 @@ def inference(
     for length in dset_lengths:
         accum_labels = []
         accum_scores = []
-        breakpoint()
         while sum(len(arr) for arr in accum_labels) < length:
             # Get the next batch of labels
             accum_labels.append(labels.pop(0))
@@ -257,6 +261,12 @@ if __name__ == "__main__":
     ap.add_argument("--predict", action="store_true")
     ap.add_argument("--index", type=Path)
     ap.add_argument("--gen-pmfs", action="store_true")
+    ap.add_argument(
+        "--temp-adjustment",
+        type=float,
+        default=1.0,
+        help="Temperature adjustment for calibration",
+    )
     ap.add_argument("-o", "--output-path", type=Path, default=None)
     args = ap.parse_args()
     if args.config is not None:
@@ -285,6 +295,7 @@ if __name__ == "__main__":
             index_file=args.index,
             output_path=output_path,
             make_pmfs=args.gen_pmfs,
+            temperature_adjustment=args.temp_adjustment,
         )
     elif args.test:
         inference(

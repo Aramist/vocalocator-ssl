@@ -280,9 +280,7 @@ class LVocalocator(L.LightningModule):
             pmfs = self.make_pmf_3d(batch)
         else:
             pmfs = self.make_pmf_2d(batch)
-        return pmfs.reshape(
-            pmfs.shape[0], pmfs.shape[1] * pmfs.shape[2] * pmfs.shape[3]
-        )
+        return pmfs
 
     def make_pmf_2d(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         """Computes score distributions for each candidate source location for each
@@ -317,8 +315,12 @@ class LVocalocator(L.LightningModule):
         # Grid size
         theta_min = 0
         theta_max = 2 * np.pi
-        xy_min = -1.1
-        xy_max = 1.1
+        arena_dims = self.config["dataloader"]["arena_dims"]
+        aspect_ratio = arena_dims[0] / arena_dims[1]  # width / height
+        x_min = -1
+        x_max = 1
+        y_min = -1 / aspect_ratio
+        y_max = 1 / aspect_ratio
 
         theta = np.linspace(theta_min, theta_max, num_theta)
         animal_direction = (
@@ -332,8 +334,8 @@ class LVocalocator(L.LightningModule):
 
         head_location = np.stack(
             np.meshgrid(
-                np.linspace(xy_min, xy_max, num_xy),
-                np.linspace(xy_min, xy_max, num_xy),
+                np.linspace(x_min, x_max, num_xy),
+                np.linspace(y_min, y_max, num_xy),
                 indexing="ij",
             ),  # returns tuple x,y with coords (x,y)
             axis=-1,
@@ -437,13 +439,18 @@ class LVocalocator(L.LightningModule):
         num_xy = 55
         num_z = 3
 
+        arena_dims = self.config["data"]["arena_dims"]
+        aspect_ratio = arena_dims[0] / arena_dims[1]  # width / height
+
         # Grid size
         theta_min = 0
         theta_max = 2 * np.pi
         phi_min = np.pi / 2 - 0.1
         phi_max = np.pi / 2
-        xy_min = -1.1
-        xy_max = 1.1
+        x_min = -1
+        x_max = 1
+        y_min = -1 / aspect_ratio
+        y_max = 1 / aspect_ratio
         z_min = 0.05
         z_max = 0.2
 
@@ -464,8 +471,8 @@ class LVocalocator(L.LightningModule):
 
         head_location = np.stack(
             np.meshgrid(
-                np.linspace(xy_min, xy_max, num_xy),
-                np.linspace(xy_min, xy_max, num_xy),
+                np.linspace(x_min, x_max, num_xy),
+                np.linspace(y_min, y_max, num_xy),
                 np.linspace(z_min, z_max, num_z),
                 indexing="ij",
             ),  # returns tuple x,y,z with coords (x,y,z)

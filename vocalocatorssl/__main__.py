@@ -224,12 +224,16 @@ def inference(
         for dataset_name, scores in zip(filenames, scores_by_dataset)
     }
 
+    dataset_order = list(map(str.encode, filenames))
+
     if make_pmfs:
         pmfs = [x[2] for x in preds]
         pmfs = torch.cat(pmfs, dim=0).cpu().numpy()  # These all have the same shape
-        np.savez(output_path, pmfs=pmfs, **labels, **scores)
+        np.savez(
+            output_path, pmfs=pmfs, **labels, **scores, dataset_order=dataset_order
+        )
     else:
-        np.savez(output_path, **labels, **scores)
+        np.savez(output_path, **labels, **scores, dataset_order=dataset_order)
 
     if test_mode:
         # Compute and report confidence

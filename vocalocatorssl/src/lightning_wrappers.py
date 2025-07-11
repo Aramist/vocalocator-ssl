@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from pytorch_lightning.utilities.model_summary.model_summary import ModelSummary
 from torch import optim
+from torch.nn import functional as F
 from torchmetrics.classification import MulticlassAccuracy
 
 from . import utils
@@ -109,7 +110,7 @@ class LVocalocator(L.LightningModule):
 
     def forward(
         self, audio: torch.Tensor, labels: torch.Tensor, shuffle: bool = True
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         """Computes scores between audio and labels.
 
         Args:
@@ -118,7 +119,8 @@ class LVocalocator(L.LightningModule):
             shuffle (bool, optional): Whether labels are shuffled. Defaults to True.
 
         Returns:
-            tuple[torch.Tensor, torch.Tensor]: Scores and positive label indices
+            tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]: Scores, difference
+            between highest and second-highest positive scores, and positive label indices
         """
         # Shuffle labels
         bsz = labels.shape[0]
@@ -152,7 +154,17 @@ class LVocalocator(L.LightningModule):
         or_scores = torch.logsumexp(scores, dim=-1)
         # Shape: (batch, 1 + num_negative)
 
-        return or_scores, positive_label_idx
+        sorted_positive_scores = torch.sort(
+            scores[torch.arange(bsz), positive_label_idx], dim=-1, descending=True
+        ).values
+        # Want to maximize the difference between the highest and second highest scored animal
+        score_spread = (
+            None
+            if sorted_positive_scores.shape[-1] == 1
+            else (sorted_positive_scores[:, 0] - sorted_positive_scores[:, 1])
+        )
+
+        return or_scores, score_spread, positive_label_idx
 
     def training_step(
         self, batch: dict[str, torch.Tensor], *args: tp.Any
@@ -169,9 +181,16 @@ class LVocalocator(L.LightningModule):
         audio, labels = batch["audio"], batch["labels"]
         audio = self.augmentation_transform(audio)
 
-        scores, positive_label_index = self.forward(audio, labels)
+        scores, score_spread, positive_label_index = self.forward(audio, labels)
         temperature = self.compute_temperature()
-        loss = info_nce(scores, positive_label_index, temperature=temperature)
+        softmax_loss = info_nce(scores, positive_label_index, temperature=temperature)
+        dispersion_loss = (
+            F.relu(np.log(100) - (score_spread / temperature).mean())
+            if score_spread is not None
+            else torch.tensor(0.0, device=audio.device)
+        )
+
+        total_loss = softmax_loss + dispersion_loss
 
         self.minibatch_idx += 1
         self.log(
@@ -181,8 +200,12 @@ class LVocalocator(L.LightningModule):
             on_epoch=True,
             sync_dist=False,
         )
-        self.log("train_loss", loss, on_epoch=True, on_step=False, sync_dist=False)
-        return loss
+        self.log("dispersion_loss", dispersion_loss, on_epoch=True, sync_dist=False)
+        self.log("softmax_loss", softmax_loss, on_epoch=True, sync_dist=False)
+        self.log(
+            "train_loss", total_loss, on_epoch=True, on_step=False, sync_dist=False
+        )
+        return total_loss
 
     def validation_step(
         self, batch: dict[str, torch.Tensor], *args: tp.Any
@@ -199,12 +222,26 @@ class LVocalocator(L.LightningModule):
         audio, labels = batch["audio"], batch["labels"]
 
         # Shuffled to prevent weight explosion from inflating accuracy
-        scores, positive_label_index = self.forward(audio, labels, shuffle=True)
-        # pred: (batch, )
+        scores, spreads, positive_label_index = self.forward(
+            audio, labels, shuffle=True
+        )
         metric = MulticlassAccuracy(num_classes=scores.shape[1], average="micro").to(
             labels.device
         )
         acc = metric(scores, positive_label_index)
+
+        if spreads is not None:
+            # spreads: (batch,)
+            prop_assignable = (
+                (spreads / self.compute_temperature()).cpu().numpy() > np.log(20)
+            ).mean()
+            self.log(
+                "prop_assignable_uncalibrated",
+                prop_assignable,
+                on_epoch=True,
+                sync_dist=True,
+                on_step=False,
+            )
 
         self.log("val_acc", acc, on_epoch=True, sync_dist=True, on_step=False)
         return acc

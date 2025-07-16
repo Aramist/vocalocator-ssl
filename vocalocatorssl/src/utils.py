@@ -32,6 +32,7 @@ def get_default_config() -> dict:
             "final_temperature": 0.1,
             "num_temperature_steps": 100_000,
             "temperature_schedule": "linear",  # linear, exponential
+            "entropy_coeff": 1.0,  # Coefficient for the entropy loss
         },
         # Valid architectures: simplenet, conformer
         "architecture": "simplenet",

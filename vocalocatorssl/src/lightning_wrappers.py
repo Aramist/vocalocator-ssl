@@ -43,6 +43,7 @@ class LVocalocator(L.LightningModule):
             "predict_test_mode": False,
             "predict_gen_pmfs": False,
         }
+        self.entropy_coeff = config["optimization"].get("entropy_coeff", 1.0)
 
         self.register_buffer(
             "minibatch_idx", torch.tensor(0, dtype=torch.long), persistent=True
@@ -151,12 +152,15 @@ class LVocalocator(L.LightningModule):
         or_scores = torch.logsumexp(scores, dim=-1)
         # Shape: (batch, 1 + num_negative)
 
-        positive_scores = scores[torch.arange(bsz), positive_label_idx, :]
-        score_spread = (
-            torch.max(positive_scores, dim=-1).values
-            - torch.min(positive_scores, dim=-1).values
-        )
-        return or_scores, score_spread, positive_label_idx
+        positive_scores = scores[
+            torch.arange(bsz), positive_label_idx, :
+        ]  # (batch, num_animals)
+        positive_probs = torch.softmax(positive_scores, dim=-1)  # (batch, num_animals)
+        positive_logprobs = torch.log(positive_probs + 1e-8)  # (batch, num_animals)
+        score_entropy = -torch.sum(
+            positive_probs * positive_logprobs, dim=-1
+        )  # (batch,)
+        return or_scores, score_entropy, positive_label_idx
 
     def training_step(
         self, batch: dict[str, torch.Tensor], *args: tp.Any
@@ -173,13 +177,13 @@ class LVocalocator(L.LightningModule):
         audio, labels = batch["audio"], batch["labels"]
         audio = self.augmentation_transform(audio)
 
-        scores, score_spread, positive_label_index = self.forward(audio, labels)
+        scores, score_entropy, positive_label_index = self.forward(audio, labels)
         temperature = self.compute_temperature()
         contrastive_loss = info_nce(
             scores, positive_label_index, temperature=temperature
         )
         # Encourages the score spread to be supra-threshold
-        dispersion_loss = F.relu(np.log(100) - (score_spread / temperature).mean())
+        entropy_loss = score_entropy.mean()
 
         self.minibatch_idx += 1
         self.log(
@@ -197,20 +201,20 @@ class LVocalocator(L.LightningModule):
             sync_dist=False,
         )
         self.log(
-            "dispersion_loss",
-            dispersion_loss,
+            "entropy_loss",
+            entropy_loss,
             on_epoch=True,
             on_step=False,
             sync_dist=False,
         )
         self.log(
             "train_loss",
-            contrastive_loss + dispersion_loss,
+            contrastive_loss + entropy_loss * self.entropy_coeff,
             on_epoch=True,
             on_step=False,
             sync_dist=False,
         )
-        return contrastive_loss + dispersion_loss
+        return contrastive_loss + entropy_loss
 
     def validation_step(
         self, batch: dict[str, torch.Tensor], *args: tp.Any

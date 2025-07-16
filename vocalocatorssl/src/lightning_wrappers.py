@@ -42,6 +42,7 @@ class LVocalocator(L.LightningModule):
         self.flags = {
             "predict_test_mode": False,
             "predict_gen_pmfs": False,
+            "temperature_adjustment": 1.0,  # For calibration
         }
         self.entropy_coeff = config["optimization"].get("entropy_coeff", 1.0)
 
@@ -118,7 +119,8 @@ class LVocalocator(L.LightningModule):
             shuffle (bool, optional): Whether labels are shuffled. Defaults to True.
 
         Returns:
-            tuple[torch.Tensor, torch.Tensor]: Scores and positive label indices
+            tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]: Scores, difference
+            between highest and second-highest positive scores, and positive label indices
         """
         # Shuffle labels
         bsz = labels.shape[0]
@@ -155,12 +157,7 @@ class LVocalocator(L.LightningModule):
         positive_scores = scores[
             torch.arange(bsz), positive_label_idx, :
         ]  # (batch, num_animals)
-        positive_probs = torch.softmax(positive_scores, dim=-1)  # (batch, num_animals)
-        positive_logprobs = torch.log(positive_probs + 1e-8)  # (batch, num_animals)
-        score_entropy = -torch.sum(
-            positive_probs * positive_logprobs, dim=-1
-        )  # (batch,)
-        return or_scores, score_entropy, positive_label_idx
+        return or_scores, positive_scores, positive_label_idx
 
     def training_step(
         self, batch: dict[str, torch.Tensor], *args: tp.Any
@@ -177,7 +174,12 @@ class LVocalocator(L.LightningModule):
         audio, labels = batch["audio"], batch["labels"]
         audio = self.augmentation_transform(audio)
 
-        scores, score_entropy, positive_label_index = self.forward(audio, labels)
+        scores, positive_scores, positive_label_index = self.forward(audio, labels)
+        positive_probs = torch.softmax(positive_scores, dim=-1)  # (batch, num_animals)
+        positive_logprobs = torch.log(positive_probs + 1e-8)  # (batch, num_animals)
+        score_entropy = -torch.sum(
+            positive_probs * positive_logprobs, dim=-1
+        )  # (batch,)
         temperature = self.compute_temperature()
         contrastive_loss = info_nce(
             scores, positive_label_index, temperature=temperature
@@ -231,15 +233,21 @@ class LVocalocator(L.LightningModule):
         audio, labels = batch["audio"], batch["labels"]
 
         # Shuffled to prevent weight explosion from inflating accuracy
-        scores, diffs, positive_label_index = self.forward(audio, labels, shuffle=True)
+        scores, positive_scores, positive_label_index = self.forward(
+            audio, labels, shuffle=True
+        )
         # pred: (batch, )
         metric = MulticlassAccuracy(num_classes=scores.shape[1], average="micro").to(
             labels.device
         )
         acc = metric(scores, positive_label_index)
 
+        positive_scores = positive_scores.detach().cpu().numpy()
+        positive_scores.sort(axis=1)
+        # difference between highest and second-highest scores on positive examples
+        diffs = positive_scores[:, -1] - positive_scores[:, -2]  # (batch, )
         prop_assignable = (
-            (diffs / self.compute_temperature() > np.log(20))
+            (diffs / self.compute_temperature().item() > np.log(20))
             .to(torch.float)
             .mean()
             .item()
@@ -247,7 +255,7 @@ class LVocalocator(L.LightningModule):
 
         self.log("val_acc", acc, on_epoch=True, sync_dist=True, on_step=False)
         self.log(
-            "val_prop_assignable",
+            "uncalibrated_prop_assignable",
             prop_assignable,
             on_epoch=True,
             sync_dist=True,
@@ -296,7 +304,9 @@ class LVocalocator(L.LightningModule):
 
         scores = self.scorer(audio_embeddings, location_embeddings)  # (b, n_animals)
         # Ensure the same temperature used during training is applied at inference time
-        scores = scores / self.compute_temperature()
+        temp_adjustment = self.flags["temperature_adjustment"]
+
+        scores = scores / (self.compute_temperature() * temp_adjustment)
 
         if self.flags["predict_test_mode"]:
             scores = torch.logsumexp(scores, dim=-1)  # sum over animals
@@ -309,6 +319,150 @@ class LVocalocator(L.LightningModule):
         return labels, scores
 
     def make_pmf(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Computes score distributions for each candidate source location for each
+        sound in the batch.
+
+        Args:
+            batch (dict[str, torch.Tensor]): Batch of audio samples and candidate locations.
+                audio is expected to have shape (batch, time, channels)
+                locations are expected to have shape (batch, num_negative + 1, num_animals, num_nodes, num_dims)
+
+        Returns:
+            torch.Tensor: Normalized probability distributions over arena (batch, num_theta, num_y, num_x)
+        """
+        is_3d = batch["labels"].shape[-1] == 3
+        if is_3d:
+            pmfs = self.make_pmf_3d(batch)
+        else:
+            pmfs = self.make_pmf_2d(batch)
+        return pmfs
+
+    def make_pmf_2d(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Computes score distributions for each candidate source location for each
+        sound in the batch.
+
+        Args:
+            batch (dict[str, torch.Tensor]): Batch of audio samples and candidate locations.
+                audio is expected to have shape (batch, time, channels)
+                locations are expected to have shape (batch, num_negative + 1, num_animals, num_nodes, 2)
+
+        Returns:
+            torch.Tensor: Normalized probability distributions over arena (batch, num_theta, num_y, num_x)
+        """
+        audio = batch["audio"]
+        labels = batch["labels"]
+        if len(audio.shape) == 2:
+            audio = audio.unsqueeze(0)  # Create batch dim
+        if len(labels.shape) == 4:
+            labels = labels.unsqueeze(0)  # Create batch dim
+
+        labels = labels.squeeze(
+            1
+        )  # Assume no negatives  (b, n_animals, n_nodes, n_dims)
+
+        head_to_nose_dist = torch.linalg.norm(
+            labels[..., 0, :] - labels[..., 1, :], axis=-1
+        ).mean()  # (,)
+        # Grid resolution
+        num_theta = 8
+        num_xy = 55
+
+        # Grid size
+        theta_min = 0
+        theta_max = 2 * np.pi
+        arena_dims = self.config["dataloader"]["arena_dims"]
+        aspect_ratio = arena_dims[0] / arena_dims[1]  # width / height
+        x_min = -1
+        x_max = 1
+        y_min = -1 / aspect_ratio
+        y_max = 1 / aspect_ratio
+
+        theta = np.linspace(theta_min, theta_max, num_theta)
+        animal_direction = (
+            np.stack(
+                [np.cos(theta), np.sin(theta)],
+                axis=-1,
+            )
+            * head_to_nose_dist.cpu().item()
+        )  # (n_theta, 2)
+        animal_direction = torch.from_numpy(animal_direction).float().to(labels.device)
+
+        head_location = np.stack(
+            np.meshgrid(
+                np.linspace(x_min, x_max, num_xy),
+                np.linspace(y_min, y_max, num_xy),
+                indexing="ij",
+            ),  # returns tuple x,y with coords (x,y)
+            axis=-1,
+        ).transpose(1, 0, 2)  # (n_y, n_x, 3)
+        head_location = torch.from_numpy(head_location).float().to(labels.device)
+
+        # Get the nose location grid from the head locations and the animal directions
+        head_location = head_location.reshape(1, num_xy, num_xy, 2)
+        animal_direction = animal_direction.reshape(num_theta, 1, 1, 2)
+        nose_location = head_location + animal_direction  # (n_theta, n_y, n_x, 3)
+
+        head_location = head_location.expand_as(nose_location)
+        animal_pose = torch.stack([nose_location, head_location], dim=-2)
+        # (n_theta, n_y, n_x, 2, 3)
+
+        audio_embeddings = self.audio_encoder(audio)  # (b, feats)
+        # No batch dimension in location_embeddings bc we only need one grid for all the animals
+        # Compute location embeddings in batches to avoid OOM
+        location_embeddings = self.cached_location_embeddings_grid
+        if location_embeddings is None:
+            try:
+                location_embeddings = self.location_encoder(
+                    animal_pose
+                ).cpu()  # (n_theta, n_y, n_x, feats)
+                location_embeddings = location_embeddings.reshape(
+                    -1, location_embeddings.shape[-1]
+                )
+            except RuntimeError as e:
+                print(f"OOM error in computing location embeddings: {e}")
+                print("Attempting to compute in batches...")
+                location_embeddings = torch.empty(
+                    (
+                        num_theta * num_xy * num_xy,
+                        self.location_encoder.d_embedding,
+                    ),
+                    dtype=torch.float32,
+                )
+                flat_pose = animal_pose.reshape(num_theta * num_xy * num_xy, 2, 2)
+                bsize = 2048
+                num_batches = int(np.ceil(location_embeddings.shape[0] / bsize))
+                for i in range(num_batches):
+                    bstart = i * bsize
+                    bend = min((i + 1) * bsize, location_embeddings.shape[0])
+                    location_embeddings[bstart:bend] = self.location_encoder(
+                        flat_pose[bstart:bend].cuda()
+                    ).cpu()
+            self.cached_location_embeddings_grid = location_embeddings
+
+        pmfs = []
+        temp_adjustment = self.flags["temperature_adjustment"]
+        temp = self.compute_temperature().cpu() * temp_adjustment
+        for audio_e in audio_embeddings:
+            batch_size = 512
+            audio_e = audio_e.unsqueeze(0).expand(batch_size, -1)
+            scores = torch.zeros((num_theta * num_xy * num_xy,), dtype=torch.float64)
+            for batch_start in range(0, len(scores), batch_size):
+                batch_end = min(batch_start + batch_size, len(scores))
+                loc_batch = location_embeddings[batch_start:batch_end].cuda()
+                scores[batch_start:batch_end] = (
+                    self.scorer(audio_e[: len(loc_batch)], loc_batch)
+                    .cpu()
+                    .to(torch.float64)
+                    / temp
+                )
+
+            # This part gets expensive
+            scores = torch.softmax(scores, dim=0)
+            scores = scores.reshape(num_theta, num_xy, num_xy)
+            pmfs.append(scores.to(torch.float32))
+        return torch.stack(pmfs)
+
+    def make_pmf_3d(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         """Computes score distributions for each candidate source location for each
         sound in the batch.
 
@@ -340,13 +494,18 @@ class LVocalocator(L.LightningModule):
         num_xy = 55
         num_z = 3
 
+        arena_dims = self.config["data"]["arena_dims"]
+        aspect_ratio = arena_dims[0] / arena_dims[1]  # width / height
+
         # Grid size
         theta_min = 0
         theta_max = 2 * np.pi
         phi_min = np.pi / 2 - 0.1
         phi_max = np.pi / 2
-        xy_min = -1.0
-        xy_max = 1.0
+        x_min = -1
+        x_max = 1
+        y_min = -1 / aspect_ratio
+        y_max = 1 / aspect_ratio
         z_min = 0.05
         z_max = 0.2
 
@@ -367,8 +526,8 @@ class LVocalocator(L.LightningModule):
 
         head_location = np.stack(
             np.meshgrid(
-                np.linspace(xy_min, xy_max, num_xy),
-                np.linspace(xy_min, xy_max, num_xy),
+                np.linspace(x_min, x_max, num_xy),
+                np.linspace(y_min, y_max, num_xy),
                 np.linspace(z_min, z_max, num_z),
                 indexing="ij",
             ),  # returns tuple x,y,z with coords (x,y,z)

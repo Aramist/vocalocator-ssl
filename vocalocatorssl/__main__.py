@@ -10,7 +10,7 @@ import torch
 from lightning.pytorch import callbacks
 
 from .src import utils as utilsmodule
-from .src.dataloaders import VocalizationDataset
+from .src.dataloaders import PluralVocalizationDataset
 from .src.lightning_wrappers import LVocalocator
 from .src.utils import load_json
 
@@ -86,10 +86,10 @@ def train_default(
         if index_dir is None:
             index_dir = save_directory / "indices"
             index_dir.mkdir(exist_ok=True)
-            np.save(index_dir / "train_set.npy", train_dloader.dataset.index)
-            np.save(index_dir / "val_set.npy", val_dloader.dataset.index)
+            np.savez(index_dir / "train_set.npz", **train_dloader.dataset.indices)
+            np.savez(index_dir / "val_set.npz", **val_dloader.dataset.indices)
             if test_dloader is not None:
-                np.save(index_dir / "test_set.npy", test_dloader.dataset.index)
+                np.savez(index_dir / "test_set.npz", **test_dloader.dataset.indices)
 
         # Save config
         with open(save_directory / "config.json", "w") as ctx:
@@ -105,6 +105,7 @@ def train_default(
         )
     else:
         model = LVocalocator(config)
+
     trainer.fit(model, train_dloader, val_dloader)
 
     if trainer.global_rank == 0:
@@ -127,6 +128,7 @@ def inference(
     index_file: tp.Optional[Path] = None,
     test_mode: bool = False,
     make_pmfs: bool = False,
+    temperature_adjustment: float = 1.0,
 ):
     """Runs inference on a dataset using the trained model located at `save_directory`.
 
@@ -138,6 +140,9 @@ def inference(
         output_path (Path): Path to save the predictions.
         test_mode (bool, optional): If False, the model will be used for predicting sound sources. If true
             the model's accuracy at varying distances will be tested on the provided dataset.
+        make_pmfs (bool, optional): If True, the model will generate probability mass functions (PMFs) for each prediction.
+            Defaults to False.
+        temperature_adjustment (float, optional): Temperature adjustment for calibration. Defaults to 1.0.
 
     Raises:
         FileNotFoundError: If the model is not found at `save_directory`.
@@ -180,6 +185,7 @@ def inference(
     make_pmfs = make_pmfs and not test_mode  # Mutually exclusive
     model.flags["predict_test_mode"] = test_mode  # Hack to pass args into predict_step
     model.flags["predict_gen_pmfs"] = make_pmfs
+    model.flags["temperature_adjustment"] = temperature_adjustment
     preds: tp.Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = (
         trainer.predict(
             model,
@@ -195,63 +201,25 @@ def inference(
     labels = torch.cat(labels, dim=0).cpu().numpy()
     scores = torch.cat(scores, dim=0).cpu().numpy()
 
-    # For convenience, copy the session file names into the output
-    if index_file is not None:
-        index = np.load(index_file)
-    else:
-        index = np.arange(len(scores))
-    __dset: VocalizationDataset = dloader.dataset
-    # Trigger the dataset to regenerate the h5py link
-    _ = __dset[(0, None)]
-    if "orig_file" in __dset.dataset and "orig_filenames" in __dset.dataset:
-        session_idx = __dset.dataset["orig_file"][:][index]  # (num_vocalizations, ) int
-        session_names = __dset.dataset["orig_filenames"][
-            :
-        ]  # (num_sessions, ) bytestrings
-    else:
-        session_idx = None
-        session_names = None
-
     if make_pmfs:
         pmfs = [x[2] for x in preds]
-        pmfs = torch.cat(pmfs, dim=0).cpu().numpy()
+        pmfs = torch.cat(pmfs, dim=0).cpu().numpy()  # These all have the same shape
         np.savez(
-            output_path,
-            labels=labels,
-            scores=scores,
-            pmfs=pmfs,
-            session_idx=session_idx,
-            session_names=session_names,
+            output_path, pmfs=pmfs, **labels, **scores, dataset_order=dataset_order
         )
     else:
-        np.savez(
-            output_path,
-            labels=labels,
-            scores=scores,
-            session_idx=session_idx,
-            session_names=session_names,
-        )
+        np.savez(output_path, **labels, **scores, dataset_order=dataset_order)
 
     if test_mode:
-        # Compute and report accuracy
-        # labels should have shape (N, num_negative+1, num_animals, num_nodes, num_dimensions)
-        if labels.shape[-3] == 1:
-            # If we have ground truth labels, we can compute accuracy
-            dist_bins, accs = utilsmodule.compute_test_accuracy(
-                labels, scores, dloader.dataset.arena_dims
-            )
-
-            with open(save_directory / "test_accuracy.txt", "w") as ctx:
-                header = "Distance (cm),Accuracy (%)"
-                print(header)
-                ctx.write(header + "\n")
-                for dist, acc in zip(dist_bins, accs):
-                    line = f"{float(dist):.1f},{float(acc):.3f}"
-                    print(line)
-                    ctx.write(line + "\n")
-
         # Compute and report confidence
-        cal_bins, calibration_curve = utilsmodule.compute_test_calibration(scores)
+        # in test mode the num_animal dimensions is reduced out
+        # scores should have shape (N, num_negative + 1)
+        scores_concat = np.concatenate(
+            [scores[f"{dataset_name}-scores"] for dataset_name in filenames], axis=0
+        )
+        cal_bins, calibration_curve = utilsmodule.compute_test_calibration(
+            scores_concat
+        )
         with open(save_directory / "test_calibration.txt", "w") as ctx:
             header = "bin_center,accuracy"
             print(header)
@@ -272,6 +240,12 @@ if __name__ == "__main__":
     ap.add_argument("--predict", action="store_true")
     ap.add_argument("--index", type=Path)
     ap.add_argument("--gen-pmfs", action="store_true")
+    ap.add_argument(
+        "--temp-adjustment",
+        type=float,
+        default=1.0,
+        help="Temperature adjustment for calibration",
+    )
     ap.add_argument("-o", "--output-path", type=Path, default=None)
     args = ap.parse_args()
     if args.config is not None:
@@ -300,6 +274,7 @@ if __name__ == "__main__":
             index_file=args.index,
             output_path=output_path,
             make_pmfs=args.gen_pmfs,
+            temperature_adjustment=args.temp_adjustment,
         )
     elif args.test:
         inference(

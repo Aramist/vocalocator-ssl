@@ -228,8 +228,13 @@ class PolynomialFourier(LocationEmbedding):
         self.d_embedding = d_embedding
         self.d_location = d_location  # Ignore this. Assuming we always have 3D x 2 locations (head + nose; x,y,z)
 
+        if self.d_location == 4:
+            layer_size = (self.k + 1) ** 2 + (2 * self.m)
+        else:
+            layer_size = (self.k + 1) ** 2 + (self.l + 1) + (2 * self.m)
+
         layers = [
-            nn.Linear((self.k + 1) ** 2 + (self.l + 1) + (2 * self.m), d_hidden),
+            nn.Linear(layer_size, d_hidden),
             nn.ReLU(),
         ]
         for _ in range(num_layers - 1):
@@ -239,25 +244,21 @@ class PolynomialFourier(LocationEmbedding):
         self.mlp = nn.Sequential(*layers)
 
         self.fourier_linear = nn.Linear(
-            2,
+            2 if self.d_location == 6 else 1,
             self.m,
         )
 
         nn.init.normal_(self.fourier_linear.weight, mean=0, std=1 / init_bandwidth)
 
-    def forward(self, locations: torch.Tensor) -> torch.Tensor:
-        """Generates a fixed-size embedding from a batch of location coordinates.
+    def forward_3d(self, locations: torch.Tensor) -> torch.Tensor:
+        """Generates a fixed-size embedding from a batch of 3D location coordinates.
 
         Args:
-            locations (torch.Tensor): (*batch, num_nodes=2, num_dims=3) tensor of location coordinates
+            locations (torch.Tensor): (*batch, num_nodes=2, num_dims=3) tensor of 3D location coordinates
 
         Returns:
             torch.Tensor: (*batch, d_embedding) tensor of embeddings
         """
-        if locations.shape[-2] != 2 or locations.shape[-1] != 3:
-            raise ValueError(
-                f"locations must have shape (*batch, num_nodes=2, num_dims=3), got {locations.shape}"
-            )
 
         xy = locations[..., 0, :2].cpu().numpy()
         z = locations[..., 0, 2].cpu().numpy()
@@ -285,6 +286,60 @@ class PolynomialFourier(LocationEmbedding):
         # shape is (*batch, (k+1)**2 + (l+1) + 2*m)
 
         return self.mlp(features)
+
+    def forward_2d(self, locations: torch.Tensor) -> torch.Tensor:
+        """Generates a fixed-size embedding from a batch of 2D location coordinates.
+
+        Args:
+            locations (torch.Tensor): (*batch, num_nodes=2, num_dims=2) tensor of 2D location coordinates
+
+        Returns:
+            torch.Tensor: (*batch, d_embedding) tensor of embeddings
+        """
+        xy = locations[..., 0, :2].cpu().numpy()
+        head_direction = locations[..., 0, :] - locations[..., 1, :]
+        theta = torch.atan2(head_direction[..., 1], head_direction[..., 0])[
+            ..., None
+        ]  # (*batch, 1)
+
+        # Create the polynomial features
+        xy_feats = np.polynomial.legendre.legvander2d(
+            xy[..., 0], xy[..., 1], (self.k, self.k)
+        )  # (*batch, (k+1)**2)
+        xy_feats = torch.from_numpy(xy_feats).to(torch.float32).to(locations.device)
+
+        angle_mapping = self.fourier_linear(theta)
+        angle_feats = torch.cat(
+            [torch.cos(angle_mapping), torch.sin(angle_mapping)], dim=-1
+        ) / np.sqrt(2 * self.m)
+
+        features = torch.cat([xy_feats, angle_feats], dim=-1)
+        # shape is (*batch, (k+1)**2 + 2*m)
+
+        return self.mlp(features)
+
+    def forward(self, locations: torch.Tensor) -> torch.Tensor:
+        """Generates a fixed-size embedding from a batch of location coordinates.
+
+        Args:
+            locations (torch.Tensor): (*batch, num_nodes=2, num_dims=3|2) tensor of location coordinates
+
+        Returns:
+            torch.Tensor: (*batch, d_embedding) tensor of embeddings
+        """
+        if locations.shape[-2] != 2:
+            raise ValueError(
+                f"locations must have shape (*batch, num_nodes=2, num_dims=3|2), got {locations.shape}"
+            )
+
+        if locations.shape[-1] == 3:
+            return self.forward_3d(locations)
+        elif locations.shape[-1] == 2:
+            return self.forward_2d(locations)
+        else:
+            raise ValueError(
+                f"locations must have shape (*batch, num_nodes=2, num_dims=3|2), got {locations.shape}"
+            )
 
 
 if __name__ == "__main__":

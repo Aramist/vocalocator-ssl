@@ -265,7 +265,9 @@ class LVocalocator(L.LightningModule):
         return acc
 
     def on_predict_start(self):
-        print(f"Starting prediction with temperature: {self.compute_temperature():.2f}")
+        print(
+            f"Starting prediction with temperature: {self.compute_temperature():.2f} and temperature adjustment: {self.flags['temperature_adjustment']:.2f}"
+        )
 
     def predict_step(
         self, batch: dict[str, torch.Tensor], *args: tp.Any

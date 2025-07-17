@@ -195,11 +195,36 @@ def inference(
         )
     )
 
-    labels = [x[0] for x in preds]
-    scores = [x[1] for x in preds]
+    labels = [x[0].cpu().numpy() for x in preds]
+    scores = [x[1].cpu().numpy() for x in preds]
 
-    labels = torch.cat(labels, dim=0).cpu().numpy()
-    scores = torch.cat(scores, dim=0).cpu().numpy()
+    dset: PluralVocalizationDataset = dloader.dataset
+    filenames = dset.filenames
+    dset_lengths = dset.lengths
+
+    # Concatenate predictions and labels within each dataset
+    labels_by_dataset = []
+    scores_by_dataset = []
+    for length in dset_lengths:
+        accum_labels = []
+        accum_scores = []
+        while sum(len(arr) for arr in accum_labels) < length:
+            # Get the next batch of labels
+            accum_labels.append(labels.pop(0))
+            accum_scores.append(scores.pop(0))
+        labels_by_dataset.append(np.concatenate(accum_labels, axis=0))
+        scores_by_dataset.append(np.concatenate(accum_scores, axis=0))
+
+    labels = {
+        f"{dataset_name}-labels": labels
+        for dataset_name, labels in zip(filenames, labels_by_dataset)
+    }
+    scores = {
+        f"{dataset_name}-scores": scores
+        for dataset_name, scores in zip(filenames, scores_by_dataset)
+    }
+
+    dataset_order = list(map(str.encode, filenames))
 
     if make_pmfs:
         pmfs = [x[2] for x in preds]

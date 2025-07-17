@@ -8,7 +8,7 @@ version = "0.0.1"
 authors = [
   { name="NeuroStats Lab" },
 ]
-description = "Tool for self-supervised sound-source localization of vocal calls"
+description = "Tool for weakly-supervised sound-source localization of vocal calls"
 readme = "README.md"
 requires-python = ">=3.9"
 classifiers = [

@@ -1,10 +1,10 @@
 import typing as tp
+from pathlib import Path
 
 import lightning as L
 import numpy as np
 import torch
 from torch import optim
-from torch.nn import functional as F
 from torchmetrics.classification import MulticlassAccuracy
 
 from . import utils
@@ -171,21 +171,23 @@ class LVocalocator(L.LightningModule):
         Returns:
             torch.Tensor: Scalar loss value for this minibatch
         """
+        temperature = self.compute_temperature()
         audio, labels = batch["audio"], batch["labels"]
         audio = self.augmentation_transform(audio)
 
         scores, positive_scores, positive_label_index = self.forward(audio, labels)
-        positive_probs = torch.softmax(positive_scores, dim=-1)  # (batch, num_animals)
+        positive_probs = torch.softmax(
+            positive_scores / temperature, dim=-1
+        )  # (batch, num_animals)
         positive_logprobs = torch.log(positive_probs + 1e-8)  # (batch, num_animals)
         score_entropy = -torch.sum(
             positive_probs * positive_logprobs, dim=-1
         )  # (batch,)
-        temperature = self.compute_temperature()
         contrastive_loss = info_nce(
             scores, positive_label_index, temperature=temperature
         )
         # Encourages the score spread to be supra-threshold
-        entropy_loss = score_entropy.mean()
+        entropy_loss = score_entropy.mean() * self.entropy_coeff
 
         self.minibatch_idx += 1
         self.log(
@@ -211,7 +213,7 @@ class LVocalocator(L.LightningModule):
         )
         self.log(
             "train_loss",
-            contrastive_loss + entropy_loss * self.entropy_coeff,
+            contrastive_loss + entropy_loss,
             on_epoch=True,
             on_step=False,
             sync_dist=False,
@@ -242,16 +244,12 @@ class LVocalocator(L.LightningModule):
         )
         acc = metric(scores, positive_label_index)
 
-        positive_scores = positive_scores.detach().cpu().numpy()
-        positive_scores.sort(axis=1)
-        # difference between highest and second-highest scores on positive examples
-        diffs = positive_scores[:, -1] - positive_scores[:, -2]  # (batch, )
-        prop_assignable = (
-            (diffs / self.compute_temperature().item() > np.log(20))
-            .to(torch.float)
-            .mean()
-            .item()
+        positive_scores = torch.softmax(
+            positive_scores / self.compute_temperature().item(), dim=-1
         )
+        positive_scores = positive_scores.detach().cpu().numpy()
+        confidence = positive_scores.max(axis=-1)  # (batch, )
+        prop_assignable = (confidence > 0.95).mean().item()
 
         self.log("val_acc", acc, on_epoch=True, sync_dist=True, on_step=False)
         self.log(
@@ -492,17 +490,18 @@ class LVocalocator(L.LightningModule):
         ).mean()  # (,)
         # Grid resolution
         num_theta = 8
-        num_phi = 1
+        num_phi = 4
         num_xy = 55
         num_z = 3
 
-        arena_dims = self.config["data"]["arena_dims"]
+        arena_dims = self.config["dataloader"]["arena_dims"]
         aspect_ratio = arena_dims[0] / arena_dims[1]  # width / height
 
         # Grid size
         theta_min = 0
         theta_max = 2 * np.pi
-        phi_min = np.pi / 2 - 0.1
+        # phi_min = np.pi / 2 - 0.1
+        phi_min = 0
         phi_max = np.pi / 2
         x_min = -1
         x_max = 1
@@ -555,7 +554,7 @@ class LVocalocator(L.LightningModule):
         if location_embeddings is None:
             try:
                 location_embeddings = self.location_encoder(
-                    animal_pose
+                    animal_pose.cuda()
                 ).cpu()  # (n_theta, n_phi, n_z, n_y, n_x, feats)
                 location_embeddings = location_embeddings.reshape(
                     -1, location_embeddings.shape[-1]
@@ -589,15 +588,14 @@ class LVocalocator(L.LightningModule):
             batch_size = 512
             audio_e = audio_e.unsqueeze(0).expand(batch_size, -1)
             scores = torch.zeros(
-                (num_theta * num_phi * num_z * num_xy * num_xy,), dtype=torch.float64
+                (num_theta * num_phi * num_z * num_xy * num_xy,), dtype=torch.float32
             )
             for batch_start in range(0, len(scores), batch_size):
                 batch_end = min(batch_start + batch_size, len(scores))
                 loc_batch = location_embeddings[batch_start:batch_end].cuda()
                 scores[batch_start:batch_end] = (
-                    self.scorer(audio_e[: len(loc_batch)], loc_batch)
-                    .cpu()
-                    .to(torch.float64)
+                    self.scorer(audio_e[: len(loc_batch)], loc_batch).cpu()
+                    # .to(torch.float64)
                     / temp
                 )
 
@@ -606,7 +604,7 @@ class LVocalocator(L.LightningModule):
             # Sum over phi, z
             scores = scores.reshape(num_theta, num_phi, num_z, num_xy, num_xy)
             scores = scores.sum(dim=(1, 2))  # (n_theta, n_y, n_x)
-            pmfs.append(scores.to(torch.float32))
+            pmfs.append(scores)
         return torch.stack(pmfs)
 
     def configure_optimizers(self):
@@ -630,3 +628,11 @@ class LVocalocator(L.LightningModule):
                 "monitor": "train_loss",
             },
         }
+
+    def on_validation_start(self):
+        """Save a checkpoint on each epoch"""
+        cur_epoch = self.current_epoch
+        save_dir = self.trainer.log_dir
+        save_path = Path(save_dir) / f"checkpoint_epoch_{cur_epoch:03d}.ckpt"
+        if not save_path.exists():
+            self.trainer.save_checkpoint(save_path)

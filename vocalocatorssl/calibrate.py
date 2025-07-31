@@ -168,4 +168,5 @@ if __name__ == "__main__":
         args.predictions,
         **{file: data[file] for file in data_files},
         **assignments,
+        optimal_temperature_adjustment=np.array(temp_adjustment),
     )

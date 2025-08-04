@@ -9,7 +9,8 @@
         "initial_temperature": 1.0,
         "final_temperature": 0.01,
         "num_temperature_steps": 50000,
-        "temperature_schedule": "exponential"
+        "temperature_schedule": "exponential",
+        "entropy_coeff": 4.0
     },
     "architecture": "conformer",
     "model_params": {
@@ -55,11 +56,11 @@
     "augmentations": {
         "should_use_augmentations": true,
         "mask_temporal_prob": 0.5,
-        "mask_temporal_min_length": 1024,
-        "mask_temporal_max_length": 2048,
+        "mask_temporal_min_length": 0.25,
+        "mask_temporal_max_length": 0.5,
         "mask_channels_prob": 0.25,
-        "mask_channels_min_channels": 3,
-        "mask_channels_max_channels": 12,
+        "mask_channels_min_channels": 6,
+        "mask_channels_max_channels": 16,
         "noise_injection_prob": 0.5,
         "noise_injection_snr_min": 4,
         "noise_injection_snr_max": 15

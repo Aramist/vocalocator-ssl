@@ -1,5 +1,4 @@
 import typing as tp
-from pathlib import Path
 
 import lightning as L
 import numpy as np
@@ -628,11 +627,3 @@ class LVocalocator(L.LightningModule):
                 "monitor": "train_loss",
             },
         }
-
-    def on_validation_start(self):
-        """Save a checkpoint on each epoch"""
-        cur_epoch = self.current_epoch
-        save_dir = self.trainer.log_dir
-        save_path = Path(save_dir) / f"checkpoint_epoch_{cur_epoch:03d}.ckpt"
-        if not save_path.exists():
-            self.trainer.save_checkpoint(save_path)

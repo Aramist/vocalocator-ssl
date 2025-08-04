@@ -117,7 +117,9 @@ def get_assignments(
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="Assign vocalizations to animals based on model predictions and calibration results."
+    )
     ap.add_argument("predictions", type=Path, help="Path to model --predict output")
     ap.add_argument(
         "--calibration-results",

@@ -358,7 +358,7 @@ def initialize_inference_dataloader(
     config: dict,
     dataset_path: Path,
     index_path: tp.Optional[Path],
-    test_mode: bool = False,
+    calibrate_mode: bool = False,
 ) -> DataLoader:
     """Initializes the inference dataset
 
@@ -367,17 +367,17 @@ def initialize_inference_dataloader(
         dataset_path (Path): Path to dataset. Expected to be an HDF5 file
         index_path (tp.Optional[Path]): Path to a numpy file containing the indices of the
     dataset to use for inference. If none is provided, the entire dataset will be used.
-        test_mode (bool, optional): If True, the model's accuracy at varying distances will be
-    tested on the provided dataset. Otherwise, the model will be set up to predict sound sources.
+        calibrate_mode (bool, optional): If True, the model's accuracy against many negative samples will be evaluated.
+            Otherwise, the model will be set up to predict sound sources.
     Defaults to False.
     """
 
     num_inference_samples = (
-        config["evaluation"]["num_samples_per_vocalization"] if test_mode else 0
+        config["evaluation"]["num_samples_per_vocalization"] if calibrate_mode else 0
     )
     batch_size = (
         config["evaluation"].get("eval_batch_size", 1)
-        if test_mode
+        if calibrate_mode
         else config["dataloader"]["batch_size"]
     )
     dataloader = build_inference_dataset(
@@ -472,57 +472,7 @@ def point_in_conf_set(
     return result
 
 
-def compute_test_accuracy(
-    labels: np.ndarray,
-    scores: np.ndarray,
-    arena_dims: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Computes the accuracy of the model at different distances.
-
-    Args:
-        labels (np.ndarray): Labels. Shape (n_samples, n_negative + 1, n_nodes, n_dims)
-        scores (np.ndarray): Scores. Shape (n_samples, n_negative + 1)
-        arena_dims (np.ndarray): Arena dimensions. Shape (3,)
-
-    Returns:
-        tuple[np.ndarray, np.ndarray]: Distances and accuracies
-    """
-    # Drop the z dimension and the head node
-    labels = labels[..., 0, :2]  # (B, 1 + n_negative, 2)
-    # Convert to cm
-    scale_factor = arena_dims.max() / 2 / 10
-    labels *= scale_factor
-
-    positive_labels = labels[:, 0]  # (B, 2)
-    positive_scores = scores[:, 0]  # (B, )
-    negative_labels = labels[:, 1:]  # (B, n_negative, 2)
-    negative_scores = scores[:, 1:]  # (B, n_negative)
-
-    # Distance between each positive label and its corresponding negative labels
-    pos_to_neg_dist = np.linalg.norm(
-        positive_labels[:, None, :] - negative_labels, axis=-1
-    )  # (B, n_negative)
-    # If this is a True, the negative label is correctly rejected
-    assignment = negative_scores < positive_scores[:, None]  # (B, n_negative).
-
-    pos_to_neg_dist = pos_to_neg_dist.reshape(-1)  # (B * n_negative, )
-    assignment = assignment.reshape(-1)  # (B * n_negative, )
-
-    # Bin according to distances
-    distance_bins = np.linspace(0, 40, 41, endpoint=True)
-    bin_indices = np.digitize(pos_to_neg_dist, distance_bins) - 1  # (B * n_negative, )
-
-    # Compute the accuracy for each bin
-    bin_acc = np.zeros((len(distance_bins) - 1), dtype=float)
-    for j in range(len(distance_bins) - 1):
-        bin_mask = bin_indices == j
-        bin_acc[j] = assignment[bin_mask].mean() if np.any(bin_mask) else 0.0
-
-    bin_centers = (distance_bins[:-1] + distance_bins[1:]) / 2
-    return bin_centers, bin_acc
-
-
-def compute_test_calibration(
+def compute_calibration(
     scores: np.ndarray,
     num_bins: int = 20,
 ) -> tuple[np.ndarray, np.ndarray]:

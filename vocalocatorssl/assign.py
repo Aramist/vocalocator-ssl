@@ -120,9 +120,9 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("predictions", type=Path, help="Path to model --predict output")
     ap.add_argument(
-        "--test-results",
+        "--calibration-results",
         type=Path,
-        help="Path to model --test output, for computing calibration",
+        help="Path to model --calibrate output, for computing calibrated assignments.",
     )
     ap.add_argument(
         "--conf-threshold",
@@ -139,9 +139,9 @@ if __name__ == "__main__":
         )
 
     temp_adjustment = 1.0
-    if args.test_results is not None:
+    if args.calibration_results is not None:
         unadjusted_ece, adjusted_ece, opt_temp = get_calibration_stats(
-            args.test_results
+            args.calibration_results
         )
         temp_adjustment = opt_temp
         print(f"ECE before calibration: {unadjusted_ece:.4f}")

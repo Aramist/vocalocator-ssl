@@ -40,7 +40,7 @@ class LVocalocator(L.LightningModule):
         self.scorer = utils.initialize_scorer(config)
         self.augmentation_transform = utils.initialize_augmentations(config)
         self.flags = {
-            "predict_test_mode": False,
+            "predict_calibrate_mode": False,
             "predict_gen_pmfs": False,
             "temperature_adjustment": 1.0,  # For calibration
         }
@@ -292,7 +292,7 @@ class LVocalocator(L.LightningModule):
         if len(labels.shape) == 4:
             labels = labels.unsqueeze(0)  # Create batch dim
 
-        if not self.flags["predict_test_mode"]:
+        if not self.flags["predict_calibrate_mode"]:
             labels = labels.squeeze(1)  # Assume no negatives
 
         audio_embeddings = self.audio_encoder(audio)  # (b, feats)
@@ -308,7 +308,7 @@ class LVocalocator(L.LightningModule):
 
         scores = scores / (self.compute_temperature() * temp_adjustment)
 
-        if self.flags["predict_test_mode"]:
+        if self.flags["predict_calibrate_mode"]:
             scores = torch.logsumexp(scores, dim=-1)  # sum over animals
 
         if self.flags["predict_gen_pmfs"]:

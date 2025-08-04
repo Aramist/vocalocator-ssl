@@ -126,7 +126,7 @@ def inference(
     *,
     output_path: Path,
     index_file: tp.Optional[Path] = None,
-    test_mode: bool = False,
+    calibrate_mode: bool = False,
     make_pmfs: bool = False,
     temperature_adjustment: float = 1.0,
 ):
@@ -138,8 +138,8 @@ def inference(
         save_directory (Path): Path to the directory containing the trained model.
         index_file (tp.Optional[Path], optional): Path ta a numpy array containing indices to process. Defaults to None.
         output_path (Path): Path to save the predictions.
-        test_mode (bool, optional): If False, the model will be used for predicting sound sources. If true
-            the model's accuracy at varying distances will be tested on the provided dataset.
+        calibrate_mode (bool, optional): If False, the model will be used for predicting sound sources. If true
+            the model's accuracy will be evaluated against many negative samples.
         make_pmfs (bool, optional): If True, the model will generate probability mass functions (PMFs) for each prediction.
             Defaults to False.
         temperature_adjustment (float, optional): Temperature adjustment for calibration. Defaults to 1.0.
@@ -174,7 +174,7 @@ def inference(
         )
 
     dloader = utilsmodule.initialize_inference_dataloader(
-        model.config, data_path, index_file, test_mode=test_mode
+        model.config, data_path, index_file, calibrate_mode=calibrate_mode
     )
 
     trainer = make_trainer(
@@ -182,8 +182,10 @@ def inference(
         save_directory,
         logger=False,
     )
-    make_pmfs = make_pmfs and not test_mode  # Mutually exclusive
-    model.flags["predict_test_mode"] = test_mode  # Hack to pass args into predict_step
+    make_pmfs = make_pmfs and not calibrate_mode  # Mutually exclusive
+    model.flags["predict_calibrate_mode"] = (
+        calibrate_mode  # Hack to pass args into predict_step
+    )
     model.flags["predict_gen_pmfs"] = make_pmfs
     model.flags["temperature_adjustment"] = temperature_adjustment
     preds: tp.Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = (
@@ -235,17 +237,15 @@ def inference(
     else:
         np.savez(output_path, **labels, **scores, dataset_order=dataset_order)
 
-    if test_mode:
+    if calibrate_mode:
         # Compute and report confidence
-        # in test mode the num_animal dimensions is reduced out
+        # in calibrate mode the num_animal dimensions is reduced out
         # scores should have shape (N, num_negative + 1)
         scores_concat = np.concatenate(
             [scores[f"{dataset_name}-scores"] for dataset_name in filenames], axis=0
         )
-        cal_bins, calibration_curve = utilsmodule.compute_test_calibration(
-            scores_concat
-        )
-        with open(save_directory / "test_calibration.txt", "w") as ctx:
+        cal_bins, calibration_curve = utilsmodule.compute_calibration(scores_concat)
+        with open(save_directory / "calibration.txt", "w") as ctx:
             header = "bin_center,accuracy"
             print(header)
             ctx.write(header + "\n")
@@ -261,7 +261,7 @@ if __name__ == "__main__":
     ap.add_argument("--config", type=Path)
     ap.add_argument("--save-path", type=Path)
     ap.add_argument("--finetune-from", type=Path)
-    ap.add_argument("--test", action="store_true")
+    ap.add_argument("--calibrate", action="store_true")
     ap.add_argument("--predict", action="store_true")
     ap.add_argument("--index", type=Path)
     ap.add_argument("--gen-pmfs", action="store_true")
@@ -276,7 +276,7 @@ if __name__ == "__main__":
     if args.config is not None:
         # If we have a config, use it to override defualts / pretrain config
         config = load_json(args.config)
-    elif args.predict or args.test:
+    elif args.predict or args.calibrate:
         config = None
     else:
         # config cannot be none during training
@@ -301,13 +301,13 @@ if __name__ == "__main__":
             make_pmfs=args.gen_pmfs,
             temperature_adjustment=args.temp_adjustment,
         )
-    elif args.test:
+    elif args.calibrate:
         inference(
             args.data,
             args.save_path,
             index_file=args.index,
             output_path=output_path,
-            test_mode=True,
+            calibrate_mode=True,
         )
     else:
         args.save_path.mkdir(parents=True, exist_ok=True)

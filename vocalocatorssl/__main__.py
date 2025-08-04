@@ -51,7 +51,10 @@ def make_trainer(config: dict, save_directory: Path, **kwargs) -> L.Trainer:
             callbacks.EarlyStopping(monitor="val_acc", mode="max", patience=100),
             # End training if weights explode
             callbacks.EarlyStopping(
-                monitor="train_loss", check_finite=True, verbose=False, patience=1000
+                monitor="total_training_loss",
+                check_finite=True,
+                verbose=False,
+                patience=1000,
             ),
             # Log learning rates
             callbacks.LearningRateMonitor(logging_interval="epoch"),

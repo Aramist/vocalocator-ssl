@@ -185,33 +185,33 @@ class LVocalocator(L.LightningModule):
         contrastive_loss = info_nce(
             scores, positive_label_index, temperature=temperature
         )
-        # Encourages the score spread to be supra-threshold
+        # Encourages the model to not score all animals associated with the same vocalization equally
         entropy_loss = score_entropy.mean() * self.entropy_coeff
 
         self.minibatch_idx += 1
         self.log(
-            "infonce_temperature",
+            "loss_temperature",
             temperature,
             on_step=False,
             on_epoch=True,
             sync_dist=False,
         )
         self.log(
-            "contrastive_loss",
+            "contrastive_loss_term",
             contrastive_loss,
             on_epoch=True,
             on_step=False,
             sync_dist=False,
         )
         self.log(
-            "entropy_loss",
+            "entropy_loss_term",
             entropy_loss,
             on_epoch=True,
             on_step=False,
             sync_dist=False,
         )
         self.log(
-            "train_loss",
+            "total_training_loss",
             contrastive_loss + entropy_loss,
             on_epoch=True,
             on_step=False,
@@ -624,6 +624,6 @@ class LVocalocator(L.LightningModule):
                 "scheduler": sched,
                 "interval": "epoch",
                 "frequency": 1,
-                "monitor": "train_loss",
+                "monitor": "total_training_loss",
             },
         }

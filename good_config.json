@@ -1,32 +1,41 @@
 {
     "optimization": {
-        "num_weight_updates": 100000,
-        "weight_updates_per_epoch": 1000,
-        "num_warmup_steps": 1000,
+        "num_weight_updates": 1000000,
         "optimizer": "sgd",
         "momentum": 0.8,
         "weight_decay": 0,
         "clip_gradients": true,
-        "initial_learning_rate": 1e-2
+        "initial_learning_rate": 0.008,
+        "initial_temperature": 1.0,
+        "final_temperature": 0.01,
+        "num_temperature_steps": 50000,
+        "temperature_schedule": "exponential",
+        "entropy_coeff": 4.0
     },
-    "architecture": "simplenet",
+    "architecture": "conformer",
     "model_params": {
-        "d_embedding": 128,
-        "num_channels": 24
+        "d_embedding": 128
     },
-    "location_embedding_type": "fourier",
+    "location_embedding_type": "poly-fourier",
     "location_embedding_params": {
-        "d_embedding": 128,
-        "init_bandwidth": 0.35,
-        "multinode_strategy": "absolute"
+        "d_embedding": 256,
+        "xy_poly_degree": 5,
+        "z_poly_degree": 2,
+        "angle_fourier_degree": 64,
+        "d_hidden": 256,
+        "num_layers": 2,
+        "multinode_strategy": "relative",
+        "init_bandwidth": 0.3
     },
-    "score_function_type": "cosinesim",
+    "score_function_type": "mlp",
     "score_function_params": {
-        "d_hidden": 512
+        "d_hidden": 128,
+        "num_layers": 2
     },
     "dataloader": {
         "num_microphones": 24,
-        "crop_length": 4096,
+        "batch_size": 32,
+        "crop_length": 8192,
         "arena_dims": [
             615,
             615,
@@ -38,22 +47,25 @@
             "Nose",
             "Head"
         ],
-        "num_negative_samples": 90,
+        "num_negative_samples": 19,
         "num_val_negative_samples": 19,
-        "min_difficulty": -1,
-        "max_difficulty": 1,
-        "num_difficulty_steps": 2500
+        "min_difficulty": null,
+        "max_difficulty": null,
+        "num_difficulty_steps": null
     },
     "augmentations": {
         "should_use_augmentations": true,
         "mask_temporal_prob": 0.5,
-        "mask_temporal_min_length": 915,
-        "mask_temporal_max_length": 3953,
+        "mask_temporal_min_length": 0.25,
+        "mask_temporal_max_length": 0.5,
         "mask_channels_prob": 0.25,
-        "mask_channels_min_channels": 3,
-        "mask_channels_max_channels": 6,
+        "mask_channels_min_channels": 6,
+        "mask_channels_max_channels": 16,
         "noise_injection_prob": 0.5,
-        "noise_injection_snr_min": 3.530698061861244,
-        "noise_injection_snr_max": 14.817122459314996
+        "noise_injection_snr_min": 4,
+        "noise_injection_snr_max": 15
+    },
+    "evaluation": {
+        "num_samples_per_vocalization": 200
     }
 }

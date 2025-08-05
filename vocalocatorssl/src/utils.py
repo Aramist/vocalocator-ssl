@@ -1,14 +1,20 @@
 import typing as tp
 from pathlib import Path
 
+import numpy as np
 import pyjson5
 from torch import nn, optim
 from torch.utils.data import DataLoader
 
-from .architectures import AudioEmbedder, ResnetConformer, SimpleNet, Wavenet
+from .audio_embed import AudioEmbedder, ResnetConformer, SimpleNet
 from .augmentations import AugmentationConfig, build_augmentations
 from .dataloaders import build_dataloaders, build_inference_dataset
-from .embeddings import FourierEmbedding, LocationEmbedding, MLPEmbedding
+from .location_embed import (
+    FourierEmbedding,
+    LocationEmbedding,
+    MLPEmbedding,
+    PolynomialFourier,
+)
 from .scorers import CosineSimilarityScorer, MLPScorer, Scorer
 
 
@@ -17,15 +23,18 @@ def get_default_config() -> dict:
     DEFAULT_CONFIG = {
         "optimization": {
             "num_weight_updates": 500_000,
-            "weight_updates_per_epoch": 10_000,
-            "num_warmup_steps": 10_000,
             "optimizer": "sgd",
             "momentum": 0.7,
             "weight_decay": 0,
             "clip_gradients": True,
             "initial_learning_rate": 0.003,
+            "initial_temperature": 1.0,
+            "final_temperature": 0.1,
+            "num_temperature_steps": 100_000,
+            "temperature_schedule": "linear",  # linear, exponential
+            "entropy_coeff": 1.0,  # Coefficient for the entropy loss
         },
-        # Valid architectures: wavenet, simplenet, conformer
+        # Valid architectures: simplenet, conformer
         "architecture": "simplenet",
         "model_params": {
             "d_embedding": 128,
@@ -65,8 +74,18 @@ def get_default_config() -> dict:
             "noise_injection_snr_min": 5,
             "noise_injection_snr_max": 12,
         },
-        "inference": {
-            "num_samples_per_vocalization": 1000,
+        "evaluation": {
+            "num_samples_per_vocalization": 200,
+        },
+        "finetune": {
+            "initial_learning_rate": 1e-3,  # If None, will use the learning rate from the standard config
+            "momentum": 0.9,
+            "num_weight_updates": 100_000,  # Max num weight updates
+            "method": "none",  # none, lora, last_layers
+            "num_last_layers": 1,  # If method is last_layers, how many layers to finetune
+            "lora_rank": 8,
+            "lora_alpha": 16,
+            "lora_dropout": 0.1,
         },
     }
     return DEFAULT_CONFIG
@@ -88,8 +107,16 @@ def update_recursively(dictionary: dict, defaults: dict) -> dict:
     return dictionary
 
 
+def numpy_softmax(x, axis=None, temperature=1.0):
+    x = x - np.max(x, axis=axis, keepdims=True)
+    e_x = np.exp(x / temperature)
+    return e_x / e_x.sum(axis=axis, keepdims=True)
+
+
 def initialize_optimizer(
-    config: dict, params: list | dict | tp.Iterator[nn.Parameter]
+    config: dict,
+    params: list | dict | tp.Iterator[nn.Parameter],
+    is_finetuning: bool = False,
 ) -> optim.Optimizer:
     """Initializes an optimizer based on the configuration. References the `optimization/optimizer` key
     to determine the optimizer type and the `optimization/*` keys to determine the optimizer specific
@@ -98,6 +125,8 @@ def initialize_optimizer(
     Args:
         config (dict): Configuration dictionary
         params (list | dict): Parameters to optimize
+        is_finetuning (bool): Whether the model is being finetuned or not. If True, will use the
+            finetuning specific hyperparameters
 
     Raises:
         ValueError: If the optimizer type is not recognized
@@ -111,21 +140,34 @@ def initialize_optimizer(
     if config["optimization"]["optimizer"] == "sgd":
         base_class = optim.SGD
         kwargs["momentum"] = config["optimization"].get("momentum", 0.9)
+        if is_finetuning:
+            kwargs["momentum"] = config["finetune"].get("momentum", kwargs["momentum"])
     elif config["optimization"]["optimizer"] == "adam":
         base_class = optim.Adam
         kwargs["betas"] = config["optimization"].get("adam_betas", (0.9, 0.999))
+        if is_finetuning:
+            kwargs["betas"] = config["finetune"].get("adam_betas", kwargs["betas"])
     elif config["optimization"]["optimizer"] == "adamw":
         base_class = optim.AdamW
         kwargs["betas"] = config["optimization"].get("adam_betas", (0.9, 0.999))
         kwargs["weight_decay"] = config["optimization"].get("weight_decay", 0)
+        if is_finetuning:
+            kwargs["betas"] = config["finetune"].get("adam_betas", kwargs["betas"])
+            kwargs["weight_decay"] = config["finetune"].get(
+                "weight_decay", kwargs["weight_decay"]
+            )
     else:
         raise ValueError(
             f"Unrecognized optimizer {config['optimization']['optimizer']}. Should be one of 'sgd', 'adam', 'adamw'."
         )
 
+    learning_rate = config["optimization"]["initial_learning_rate"]
+    if is_finetuning:
+        learning_rate = config["finetune"].get("initial_learning_rate", learning_rate)
+
     opt = base_class(
         params,
-        lr=config["optimization"]["initial_learning_rate"],
+        lr=learning_rate,
         **kwargs,
     )
 
@@ -204,9 +246,9 @@ def initialize_audio_embedder(config: dict) -> AudioEmbedder:
         raise ValueError("No architecture specified in config.")
     arch = arch.lower()
 
-    if arch not in ["wavenet", "simplenet", "conformer"]:
+    if arch not in ["simplenet", "conformer"]:
         raise ValueError(
-            f"Unrecognized architecture {arch}. Should be either 'wavenet', 'simplenet', or 'conformer'."
+            f"Unrecognized architecture {arch}. Should be either 'simplenet' or 'conformer'."
         )
     if "d_embedding" not in config["model_params"]:
         raise ValueError("No embedding dimension specified in model params.")
@@ -216,9 +258,7 @@ def initialize_audio_embedder(config: dict) -> AudioEmbedder:
     params["num_channels"] = num_channels
 
     model: AudioEmbedder
-    if arch == "wavenet":
-        model = Wavenet(**params)
-    elif arch == "simplenet":
+    if arch == "simplenet":
         model = SimpleNet(**params)
     else:
         model = ResnetConformer(**params)
@@ -257,6 +297,8 @@ def initialize_location_embedding(config: dict) -> LocationEmbedding:
         emb = FourierEmbedding(**config["location_embedding_params"])
     elif emb_type == "mlp":
         emb = MLPEmbedding(**config["location_embedding_params"])
+    elif emb_type == "poly-fourier":
+        emb = PolynomialFourier(**config["location_embedding_params"])
     else:
         raise ValueError(f"Unrecognized location embedding type {emb_type}")
 
@@ -313,7 +355,10 @@ def initialize_dataloaders(
 
 
 def initialize_inference_dataloader(
-    config: dict, dataset_path: Path, index_path: tp.Optional[Path]
+    config: dict,
+    dataset_path: Path,
+    index_path: tp.Optional[Path],
+    calibrate_mode: bool = False,
 ) -> DataLoader:
     """Initializes the inference dataset
 
@@ -322,16 +367,144 @@ def initialize_inference_dataloader(
         dataset_path (Path): Path to dataset. Expected to be an HDF5 file
         index_path (tp.Optional[Path]): Path to a numpy file containing the indices of the
     dataset to use for inference. If none is provided, the entire dataset will be used.
+        calibrate_mode (bool, optional): If True, the model's accuracy against many negative samples will be evaluated.
+            Otherwise, the model will be set up to predict sound sources.
+    Defaults to False.
     """
 
+    num_inference_samples = (
+        config["evaluation"]["num_samples_per_vocalization"] if calibrate_mode else 0
+    )
+    batch_size = (
+        config["evaluation"].get("eval_batch_size", 1)
+        if calibrate_mode
+        else config["dataloader"]["batch_size"]
+    )
     dataloader = build_inference_dataset(
         dataset_path,
         index_path,
         arena_dims=config["dataloader"]["arena_dims"],
         crop_length=config["dataloader"]["crop_length"],
-        batch_size=1,
+        batch_size=batch_size,
         normalize_data=config["dataloader"].get("normalize_data", True),
         node_names=config["dataloader"].get("nodes_to_load", None),
+        num_inference_samples=num_inference_samples,
     )
 
     return dataloader
+
+
+def compute_confidence_set(pmf: np.ndarray, conf_level: float = 0.95) -> np.ndarray:
+    """Computes the confidence set for a given PMF and confidence level.
+
+    Args:
+        pmf (np.ndarray): Probability mass function. Shape doesn't matter, but should be
+            unbatched.
+        conf_level (float, optional): Confidence level. Defaults to 0.95.
+
+    Returns:
+        np.ndarray: Confidence set. Bool array of same shape as pmf.
+    """
+
+    if pmf.dtype != np.float64:
+        print("Warning: pmf is not of type float64. There may be round-off errors.")
+    # sort the pmf and compute the cdf
+    flat_pmf = pmf.flatten()
+    sorting = np.argsort(-flat_pmf)  # Sort descending
+    cdf = np.cumsum(flat_pmf[sorting])
+    # find the index of the first element in the cdf that exceeds the confidence level
+    # This is the last element in the confidence set
+    last_idx = np.searchsorted(cdf, conf_level * flat_pmf.sum())
+    # create a mask of the confidence set
+    conf_set = np.zeros_like(flat_pmf, dtype=bool)
+    conf_set[sorting[: last_idx + 1]] = True
+    return conf_set.reshape(pmf.shape)
+
+
+def point_in_conf_set(
+    conf_set: np.ndarray, point: np.ndarray, range: np.ndarray
+) -> np.ndarray:
+    """Checks if a point is in the confidence set.
+
+    Args:
+        conf_set (np.ndarray): Confidence set. (n_angle, n_y, n_x) array of bools.
+        point (np.ndarray): Points to check. Should have shape (*batch, n_nodes, n_dims).
+        range (np.ndarray): Range of the confidence set. Should have shape (d, 2) where d
+            is the number of dimensions. Each row should be [min, max] for each dimension.
+
+    Returns:
+        bool array: True if the point is in the confidence set, False otherwise. shape (*batch,)
+    """
+
+    # Determine the angle bin
+    angle_bins = np.linspace(
+        0,
+        2 * np.pi,
+        conf_set.shape[0] + 1,
+        endpoint=True,
+    )
+    x_bins = np.linspace(
+        range[0, 0],
+        range[0, 1],
+        conf_set.shape[2] + 1,
+        endpoint=True,
+    )
+    y_bins = np.linspace(
+        range[1, 0],
+        range[1, 1],
+        conf_set.shape[1] + 1,
+        endpoint=True,
+    )
+    batch_size = point.shape[:-2]
+    point = point.reshape(-1, point.shape[-2], point.shape[-1])
+    # Compute the yaw
+    head_to_nose = point[:, 0, :2] - point[:, 1, :2]  # (n_pts, 2)
+    yaw = np.arctan2(head_to_nose[:, 1], head_to_nose[:, 0]) + np.pi  # (n_pts,)
+    angle_idx = np.digitize(yaw, angle_bins) - 1  # (n_pts,)
+    y_bin = np.digitize(point[:, 0, 1], y_bins) - 1  # (n_pts,)
+    y_bin = np.clip(y_bin, 0, conf_set.shape[1] - 1)
+    x_bin = np.digitize(point[:, 0, 0], x_bins) - 1  # (n_pts,)
+    x_bin = np.clip(x_bin, 0, conf_set.shape[2] - 1)
+    # Check if the point is in the confidence set
+    result = conf_set[angle_idx, y_bin, x_bin]  # (n_pts,)
+    # Reshape the result to match the batch size
+    result = result.reshape(*batch_size)
+    return result
+
+
+def compute_calibration(
+    scores: np.ndarray,
+    num_bins: int = 20,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Computes the calibration curve for the model on a dataset with known speaker identity.
+
+    Args:
+        scores (np.ndarray): Array of shape (batch, 1 + num_negative_samples) containing the scores for each sample.
+            The first entry is expected to be the score of the positive sample, and the remaining entries are the scores
+            of the negative samples for the same vocalization.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: Confidence bin left edges and the corresponding accuracies
+    """
+    pos_scores = scores[:, 0]  # (B, )
+    neg_scores = scores[:, 1:]  # (B, n_negative)
+
+    num_negative = neg_scores.shape[1]
+    pos_scores = pos_scores.repeat(num_negative, axis=0)  # (B * n_negative, )
+    neg_scores = neg_scores.reshape(-1)  # (B * n_negative, )
+
+    pos_neg_probs = np.stack([pos_scores, neg_scores], axis=1)  # (B * n_negative, 2)
+    pos_neg_probs = numpy_softmax(pos_neg_probs, axis=1)
+
+    Y_hat = pos_neg_probs.argmax(axis=1)
+    P_hat = pos_neg_probs.max(axis=1)
+
+    p_bins = np.linspace(0.5, 1.0, num_bins + 1, endpoint=True)
+    bin_indices = np.digitize(P_hat, p_bins) - 1  # (B * n_negative, )
+    bin_acc = np.zeros((num_bins,), dtype=float)
+    for j in range(num_bins):
+        bin_mask = bin_indices == j
+        bin_acc[j] = (Y_hat[bin_mask] == 0).mean() if np.any(bin_mask) else 0.0
+
+    bin_center = 0.5 * (p_bins[:-1] + p_bins[1:])  # (num_bins, )
+    return bin_center, bin_acc

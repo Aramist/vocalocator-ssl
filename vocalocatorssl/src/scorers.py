@@ -54,21 +54,36 @@ class CosineSimilarityScorer(Scorer):
 
 
 class MLPScorer(Scorer):
-    def __init__(self, d_audio_embed: int, d_location_embed: int, d_hidden: int):
+    def __init__(
+        self,
+        d_audio_embed: int,
+        d_location_embed: int,
+        d_hidden: int,
+        num_layers: int = 1,
+    ):
         """MLP based scorer for audio-location affinity.
 
         Args:
             d_audio_embed (int): Dimension of the audio embeddings
             d_location_embed (int): Dimension of the location embeddings
             d_hidden (int): Dimension of the hidden layer
+            num_layers (int, optional): Number of hidden layers. Defaults to 1.
+
+        Raises:
+            ValueError: If num_layers is less than 1.
         """
         super(MLPScorer, self).__init__(d_audio_embed, d_location_embed)
-        self.mlp = nn.Sequential(
+        if num_layers < 1:
+            raise ValueError("num_layers must be at least 1")
+        layers = [
             nn.Linear(d_audio_embed + d_location_embed, d_hidden),
             nn.ReLU(),
-            nn.Linear(d_hidden, 1),
-            nn.Sigmoid(),
-        )
+        ]
+        for _ in range(num_layers - 1):
+            layers.append(nn.Linear(d_hidden, d_hidden))
+            layers.append(nn.ReLU())
+        layers.append(nn.Linear(d_hidden, 1))
+        self.mlp = nn.Sequential(*layers)
 
     def forward(
         self, audio_embedding: torch.Tensor, location_embedding: torch.Tensor

@@ -1,12 +1,8 @@
-from typing import Literal, Optional
-
-import numpy as np
 import torch
 from torch import nn
-from torch.nn import functional as F
-from torchaudio.functional import convolve
 from torchaudio.models import Conformer
 
+from .lora import LORA_MHA, LORA_Conv1d
 from .resnet1d import ResNet1D
 
 
@@ -28,52 +24,6 @@ def gradsafe_sum(x_list: list[torch.Tensor]) -> torch.Tensor:
     for x in x_list[1:]:
         result = result + x
     return result
-
-
-class WavenetBlock(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        conv_channels: int,
-        kernel_size: int,
-        dilation: int,
-        bias=True,
-        *,
-        injection_channels: Optional[int] = None,
-    ):
-        super().__init__()
-        self.injection_linear = None
-        if injection_channels is not None:
-            self.injection_linear = nn.Linear(injection_channels, in_channels)
-
-        self.conv = nn.Conv1d(
-            in_channels=in_channels,
-            out_channels=conv_channels * 2,
-            kernel_size=kernel_size,
-            stride=1,
-            dilation=dilation,
-            bias=bias,
-            padding="same",
-        )
-        self.one_by_one = nn.Conv1d(
-            in_channels=conv_channels,
-            out_channels=in_channels,
-            kernel_size=1,
-            stride=1,
-            dilation=1,
-            bias=bias,
-        )
-
-    def forward(self, x: torch.Tensor, injection: Optional[torch.Tensor] = None):
-        if self.injection_linear is not None:
-            x = x + self.injection_linear(injection)[:, :, None]
-        conv_out = self.conv(x)
-        tanh, sigmoid = conv_out.chunk(2, dim=-2)
-        tanh = torch.tanh(tanh) * 0.95 + 0.05 * tanh
-        sigmoid = torch.sigmoid(sigmoid)
-        activation = tanh * sigmoid
-        one_by_one_output = self.one_by_one(activation)
-        return one_by_one_output + x, one_by_one_output
 
 
 class VocalocatorSimpleLayer(torch.nn.Module):
@@ -105,6 +55,16 @@ class VocalocatorSimpleLayer(torch.nn.Module):
         self.batch_norm = (
             torch.nn.BatchNorm1d(channels_out) if use_bn else nn.Identity()
         )
+
+    def LoRAfy(self, lora_rank: int, lora_alpha: float):
+        """Applies LoRA to the model to make finetuning more efficient.
+
+        Args:
+            lora_rank (int): Rank of the weight update.
+            lora_alpha (int): Scaling factor applied to weight update.
+        """
+        self.fc = LORA_Conv1d(self.fc, lora_rank, lora_alpha)
+        self.gc = LORA_Conv1d(self.gc, lora_rank, lora_alpha)
 
     def forward(self, x):
         fcx = self.fc(x)
@@ -141,121 +101,36 @@ class AudioEmbedder(nn.Module):
         )
 
     def forward(self, audio: torch.Tensor) -> torch.Tensor:
+        audio = audio.float()
+        # transpose from (batch, time, channels) to (batch, channels, time)
+        audio = audio.transpose(-1, -2)
         return self.embed_audio(audio)
 
-
-class Wavenet(AudioEmbedder):
-    def __init__(
-        self,
-        d_embedding: int,
-        num_channels: int,
-        *,
-        num_blocks: int = 10,
-        conv_channels: int = 64,
-        kernel_size: int = 7,
-        dilation: int = 3,
-        xcorr_pairs: Optional[list[tuple[int, int]]] = None,
-        xcorr_length: int = 256,
-        xcorr_hidden: int = 512,
-    ):
-        super(Wavenet, self).__init__(d_embedding, num_channels)
-
-        self.num_blocks = num_blocks
-        self.conv_channels = conv_channels
-        self.kernel_size = kernel_size
-        self.dilation = dilation
-        self.xcorr_pairs = xcorr_pairs
-        self.xcorr_length = xcorr_length
-        self.xcorr_hidden = xcorr_hidden
-        self.xcorr_mlp = None
-
-        if xcorr_pairs is not None:
-            self.xcorr_mlp = nn.Sequential(
-                nn.BatchNorm1d(len(xcorr_pairs) * xcorr_length),
-                nn.Linear(len(xcorr_pairs) * xcorr_length, xcorr_hidden),
-                nn.ReLU(),
-                nn.Linear(xcorr_hidden, xcorr_hidden),
-                nn.ReLU(),
-            )
-
-        self.blocks = nn.ModuleList(
-            [
-                WavenetBlock(
-                    in_channels=conv_channels,
-                    conv_channels=conv_channels,
-                    kernel_size=kernel_size,
-                    dilation=i % 4 + 1,
-                    injection_channels=None if self.xcorr_mlp is None else xcorr_hidden,
-                )
-                for i in range(num_blocks)
-            ]
-        )
-        self.initial_conv = nn.Conv1d(
-            in_channels=num_channels,
-            out_channels=conv_channels,
-            kernel_size=kernel_size,
-            stride=1,
-            dilation=1,
-            padding="same",
-        )
-        self.final_dense = nn.Linear(conv_channels, d_embedding)
-
-    def make_xcorrs(self, audio: torch.Tensor) -> torch.Tensor:
-        """Computes cross-correlations between the configured channel pairs
+    def LoRAfy(self, lora_rank: int, lora_alpha: float, lora_dropout: float):
+        """Applies LoRA to the model.
 
         Args:
-            x: Input tensor of shape (batch, channels, time)
+            lora_rank (int): Rank of the LoRA matrices.
+            lora_alpha (int): Scaling factor for the LoRA matrices.
+            lora_dropout (float): Dropout rate for the LoRA matrices.
+        """
+        raise NotImplementedError(
+            "AudioEmbedder.LORAfy must be implemented by subclasses"
+        )
 
-        Returns:
-            torch.Tensor: Tensor of xcorrs. Shape (batch, num_pairs * xcorr_length)
+    def last_layer_finetunify(self, num_layers: int):
+        """Freezes all but the last k layers of the model.
+
+        Args:
+            num_layers (int): Number of layers to keep trainable. If num_layers is negative,
+                the last num_layers + k layers will be trainable.
 
         Raises:
-            ValueError: If no cross-correlation pairs are configured
+            ValueError: If num_layers is zero
         """
-        if self.xcorr_pairs is None:
-            raise ValueError("No cross-correlation pairs configured")
-        xcorrs = []
-        x_len = audio.shape[-1]
-        xcorr_len = self.xcorr_length
-        centered_x = audio[
-            ..., x_len // 2 - xcorr_len // 2 : x_len // 2 + xcorr_len // 2
-        ]
-        for i, j in self.xcorr_pairs:
-            a = centered_x[:, i]
-            # Use flip to compute cross-correlation instead of convolution
-            b = torch.flip(centered_x[:, j], [-1])
-            xcorr = convolve(a, b, mode="same")
-            xcorrs.append(xcorr)
-
-        return torch.cat(xcorrs, dim=-1)
-
-    def embed_audio(self, audio: torch.Tensor):
-        """Embeds multi-channel audio into a fixed-size representation
-
-
-        Args:
-            audio: (*batch, time, channels) tensor of audio waveforms
-        """
-        audio = audio.transpose(
-            -1, -2
-        )  # transpose to (batch, channels, time) required by conv1d
-        xcorrs = None
-        if self.xcorr_mlp is not None:
-            xcorrs = self.make_xcorrs(audio)
-            xcorrs = self.xcorr_mlp(xcorrs)
-
-        output = self.initial_conv(audio)
-        one_by_ones = []
-        for block in self.blocks:
-            output, obo = block(output, xcorrs)
-            one_by_ones.append(obo)
-        # Mean over time dim
-        obo_sum = gradsafe_sum(one_by_ones).mean(dim=-1) / len(one_by_ones)
-        # Output shape is (*batch, d_conv)
-        return self.final_dense(obo_sum)
-
-    def clip_grads(self):
-        nn.utils.clip_grad_norm_(self.parameters(), 1.0, error_if_nonfinite=True)
+        raise NotImplementedError(
+            "AudioEmbedder.last_layer_finetunify must be implemented by subclasses"
+        )
 
 
 class SimpleNet(AudioEmbedder):
@@ -324,17 +199,43 @@ class SimpleNet(AudioEmbedder):
         self.final_pooling = nn.AdaptiveAvgPool1d(1)
         self.final_linear = nn.Linear(conv_channels[-1], d_embedding)
 
+    def LoRAfy(self, lora_rank: int, lora_alpha: float, lora_dropout: float):
+        """Applies LoRA to the model.
+
+        Args:
+            lora_rank (int): Rank of the LoRA matrices.
+            lora_alpha (int): Scaling factor for the LoRA matrices.
+            lora_dropout (float): Dropout rate for the LoRA matrices.
+        """
+        for layer in self.conv_layers.children():
+            if isinstance(layer, VocalocatorSimpleLayer):
+                layer.LoRAfy(lora_rank, lora_alpha)
+        self.final_linear.requires_grad_(False)
+
+    def last_layer_finetunify(self, num_layers: int):
+        """Freezes all but the last k layers of the model.
+
+        Args:
+            num_layers (int): Number of layers to keep trainable. If num_layers is negative,
+                the last num_layers + k layers will be trainable.
+
+        Raises:
+            ValueError: If num_layers is zero
+        """
+        if num_layers == 0:
+            raise ValueError("num_layers must be non-zero")
+        conv_layers = list(self.conv_layers.children())
+        if num_layers < 0:
+            num_layers += len(conv_layers)
+
+        for layer in conv_layers[:-num_layers]:
+            layer.requires_grad_(False)
+
     def embed_audio(self, audio: torch.Tensor) -> torch.Tensor:
-        audio = audio.transpose(
-            -1, -2
-        )  # (batch, seq_len, channels) -> (batch, channels, seq_len) needed by conv1d
         h1 = self.conv_layers(audio)
         h2 = torch.squeeze(self.final_pooling(h1), dim=-1)
         embedding = self.final_linear(h2)
         return embedding
-
-    def clip_grads(self):
-        nn.utils.clip_grad_norm_(self.parameters(), 1.0, error_if_nonfinite=True)
 
 
 class ResnetConformer(AudioEmbedder):
@@ -385,10 +286,6 @@ class ResnetConformer(AudioEmbedder):
         )
 
     def embed_audio(self, audio: torch.Tensor) -> torch.Tensor:
-        audio = torch.transpose(
-            audio, -1, -2
-        )  # transpose from (batch, time, channels) to (batch, channels, time)
-
         resnet_output = self.resnet(audio)
 
         conformer_input = resnet_output.permute(
@@ -402,5 +299,38 @@ class ResnetConformer(AudioEmbedder):
         output = self.dense(conformer_output)
         return output
 
-    def clip_grads(self):
-        nn.utils.clip_grad_norm_(self.parameters(), 1.0, error_if_nonfinite=True)
+    def LoRAfy(self, lora_rank: int, lora_alpha: float, lora_dropout: float):
+        """Applies LoRA to the model.
+
+        Args:
+            lora_rank (int): Rank of the LoRA matrices.
+            lora_alpha (int): Scaling factor for the LoRA matrices.
+            lora_dropout (float): Dropout rate for the LoRA matrices.
+        """
+        self.resnet.requires_grad_(False)
+        self.dense.requires_grad_(False)
+        self.conformer.requires_grad_(False)
+        for layer in self.conformer.conformer_layers:
+            layer.self_attn = LORA_MHA(layer.self_attn, lora_rank, lora_alpha)
+            layer.self_attn.requires_grad_(True)
+
+    def last_layer_finetunify(self, num_layers: int):
+        """Freezes all but the last k layers of the model.
+
+        Args:
+            num_layers (int): Number of layers to keep trainable. If num_layers is negative,
+                the last num_layers + k layers will be trainable.
+
+        Raises:
+            ValueError: If num_layers is zero
+        """
+        if num_layers == 0:
+            raise ValueError("num_layers must be non-zero")
+        conformer_layers = self.conformer.conformer_layers
+        if num_layers < 0:
+            num_layers += len(conformer_layers)
+
+        self.resnet.requires_grad_(False)
+        self.dense.requires_grad_(False)
+        for layer in conformer_layers[:-num_layers]:
+            layer.requires_grad_(False)

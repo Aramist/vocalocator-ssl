@@ -164,11 +164,10 @@ if __name__ == "__main__":
     )
 
     data = np.load(args.predictions)
-    # Append the assignments to the original data, removing old assignments if they exist
-    data_files = list(filter(lambda st: not st.endswith("assignments"), data.files))
+    data = {file: data[file] for file in data.files}
+    data.update(assignments)
+    data.update({"optimal_temperature_adjustment": np.array(temp_adjustment)})
     np.savez(
         args.predictions,
-        **{file: data[file] for file in data_files},
-        **assignments,
-        optimal_temperature_adjustment=np.array(temp_adjustment),
+        **data,
     )

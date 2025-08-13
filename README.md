@@ -23,7 +23,7 @@ Pretrained models should be distributed pre-calibrated, but if they are not, cal
 ### Inference
 Now that we have both trained weights and calibration data, we can start predicting and assigning vocalizations. The first step, *inference*, involves processing each vocalization to produce scores representing how strongly the model believes the vocalization was produced be each animal. The second step, *assignment*, takes these scores, rescoles their confidence according to the calibration data, and then assigns each vocalization to an animal.
 1. Running inference with the `--predict` flag: `python -m vocalocatorssl --data path/to/datasets/ --save-path path/to/model_dir --predict -o model_predictions.npz`
-2. Running assignment with the `--assign` flag: `python -m vocalocatorssl.assign model_predictions.npz --calibration-results path/to/model_dir/calibration_results.npz`
+2. Running assignment with the `vocalocatorssl.assign` script: `python -m vocalocatorssl.assign model_predictions.npz --calibration-results path/to/model_dir/calibration_results.npz`
 
 The assignment script modifies the `model_predictions.npz` in-place, creating arrays by the name `{dataset_name}-assignments` within the archive. These can be accessed like any other `npz` array by unzipping the file and loading each assignment array as a `npy`. The assignments array is an integer array of shape `(num_vocalizations, )` containing `-1` for unassignable vocalizations and the predicted animal's index within the dataset's `locations` array otherwise.
 ```python

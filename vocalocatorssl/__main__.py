@@ -259,22 +259,51 @@ def inference(
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data", type=Path)
-    ap.add_argument("--config", type=Path)
-    ap.add_argument("--save-path", type=Path)
-    ap.add_argument("--finetune-from", type=Path)
-    ap.add_argument("--calibrate", action="store_true")
-    ap.add_argument("--predict", action="store_true")
-    ap.add_argument("--index", type=Path)
-    ap.add_argument("--gen-pmfs", action="store_true")
+    ap = argparse.ArgumentParser("Weakly supervised vocalization assigner")
+    ap.add_argument(
+        "--data",
+        type=Path,
+        required=True,
+        help="Path to dataset or directory containing datasets.",
+    )
+    ap.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        help="Path to config JSON describing model architecture, data format, and training hyperparameters.",
+    )
+    ap.add_argument(
+        "--save-path",
+        type=Path,
+        default=".",
+        help="Directory to save model checkpoints and logs.",
+    )
+    ap.add_argument(
+        "--finetune-from", type=Path, help="Path to pretrained model for finetuning."
+    )
+    ap.add_argument("--calibrate", action="store_true", help="Run in calibration mode")
+    ap.add_argument("--predict", action="store_true", help="Run in prediction mode")
+    ap.add_argument(
+        "--index",
+        type=Path,
+        help="Path to index file or directory containing test/val/train indices.",
+    )
+    ap.add_argument(
+        "--gen-pmfs", action="store_true", help="Generate PMFs in --predict mode"
+    )
     ap.add_argument(
         "--temp-adjustment",
         type=float,
         default=1.0,
-        help="Temperature adjustment for calibration",
+        help="Temperature adjustment for generating calibrated predictions and PMFs.",
     )
-    ap.add_argument("-o", "--output-path", type=Path, default=None)
+    ap.add_argument(
+        "-o",
+        "--output-path",
+        type=Path,
+        default=None,
+        help="Path to save predictions or calibration output.",
+    )
     args = ap.parse_args()
     if args.config is not None:
         # If we have a config, use it to override defualts / pretrain config

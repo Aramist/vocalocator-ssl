@@ -189,7 +189,9 @@ class DifficultySampler(torch.utils.data.Sampler):
             ]
             indices_by_num_animals[num_animals_to_sample] = indices_by_num_animals[
                 num_animals_to_sample
-            ][end_idx:]  # Chop off the part we sampled from
+            ][
+                end_idx:
+            ]  # Chop off the part we sampled from
             if len(dset_and_data_indices) < self.batch_size:
                 # If we don't have enough indices, drop the batch
                 continue
@@ -802,9 +804,11 @@ def build_dataloaders(
             val_path,
             arena_dims=arena_dims,
             crop_length=crop_length,
-            num_negative_samples=num_negative_samples
-            if num_val_negative_samples is None
-            else num_val_negative_samples,
+            num_negative_samples=(
+                num_negative_samples
+                if num_val_negative_samples is None
+                else num_val_negative_samples
+            ),
             crop_randomly=True,
             index=data_split_indices["val"],
             normalize_data=normalize_data,
@@ -817,9 +821,11 @@ def build_dataloaders(
             val_path,
             arena_dims=arena_dims,
             crop_length=crop_length,
-            num_negative_samples=num_negative_samples
-            if num_val_negative_samples is None
-            else num_val_negative_samples,
+            num_negative_samples=(
+                num_negative_samples
+                if num_val_negative_samples is None
+                else num_val_negative_samples
+            ),
             crop_randomly=False,
             index=data_split_indices["test"],
             normalize_data=normalize_data,
@@ -912,13 +918,28 @@ def build_inference_dataset(
         VocalizationDataset: The dataset for inference
     """
 
+    # This holds the paths to all .h5 datasets we will load
+    cand_paths: list[Path]
     if dataset_path.is_dir():
         cand_paths = list(dataset_path.glob("*.h5"))
     else:
         cand_paths = [dataset_path]
 
+    indices: np.ndarray | numpy.lib.npyio.NpzFile | None
     if index_path is not None:
         indices = np.load(index_path)
+        # will be an npz archive if dataset_path is a dir (even if only one file is present)
+        # expected to be a single array if dataset_path is a single file
+        if isinstance(indices, np.ndarray) and dataset_path.is_dir():
+            raise ValueError(
+                "Index file must be a .npz archive when dataset_path is a directory"
+            )
+        elif isinstance(indices, numpy.lib.npyio.NpzFile) and not dataset_path.is_dir():
+            if cand_paths[0].stem not in indices:
+                raise ValueError(
+                    f"Index file does not contain indices for the given dataset: {cand_paths[0].stem}"
+                )
+            indices = indices[cand_paths[0].stem]
     else:
         indices = None
 
@@ -926,10 +947,17 @@ def build_inference_dataset(
 
     for cand_path in cand_paths:
         idx = None
-        if indices is not None and len(cand_paths) > 1:
-            idx = indices[cand_path.stem]
-        elif indices is not None:
-            idx = indices
+        if indices is not None:
+            # if dataset_path is not a dir, indices will always be an array
+            # if dataset_path is a dir, indices will always be an npz archive
+            if not dataset_path.is_dir():
+                idx = indices
+            else:
+                idx = indices[cand_path.stem]
+
+        # Check for empty indices, these cannot be allowed to initialize a dataset
+        if idx is not None and len(idx) == 0:
+            continue
 
         inference_dataset = SingleVocalizationDataset(
             cand_path,
@@ -943,6 +971,9 @@ def build_inference_dataset(
             construct_search_tree=False,
         )
         datasets.append(inference_dataset)
+
+    if not datasets:
+        raise ValueError("No datasets found for inference. (Possibly empty indices)")
 
     inference_dataset = PluralVocalizationDataset(datasets)
 

@@ -833,9 +833,12 @@ def build_dataloaders(
             construct_search_tree=False,
         )
 
-        training_datasets.append(training_dataset)
-        validation_datasets.append(validation_dataset)
-        test_datasets.append(test_dataset)
+        if len(data_split_indices["train"]) > num_negative_samples + 1:
+            training_datasets.append(training_dataset)
+        if len(data_split_indices["val"]) > num_negative_samples + 1:
+            validation_datasets.append(validation_dataset)
+        if len(data_split_indices["test"]) > num_negative_samples + 1:
+            test_datasets.append(test_dataset)
 
     combined_training_dataset = PluralVocalizationDataset(training_datasets)
     combined_validation_dataset = PluralVocalizationDataset(validation_datasets)

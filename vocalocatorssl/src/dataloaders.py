@@ -956,7 +956,11 @@ def build_inference_dataset(
             if not dataset_path.is_dir():
                 idx = indices
             else:
-                idx = indices[cand_path.stem]
+                if cand_path.stem in indices:
+                    idx = indices[cand_path.stem]
+                else:
+                    # If indices are provided, but don't mention this dataset, skip it
+                    continue
 
         # Check for empty indices, these cannot be allowed to initialize a dataset
         if idx is not None and len(idx) == 0:

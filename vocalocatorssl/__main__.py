@@ -269,7 +269,6 @@ if __name__ == "__main__":
     ap.add_argument(
         "--config",
         type=Path,
-        required=True,
         help="Path to config JSON describing model architecture, data format, and training hyperparameters.",
     )
     ap.add_argument(

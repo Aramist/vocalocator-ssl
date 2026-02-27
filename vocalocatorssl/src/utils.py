@@ -11,12 +11,8 @@ from torch.utils.data import DataLoader
 from .audio_embed import AudioEmbedder, ResnetConformer, SimpleNet
 from .augmentations import AugmentationConfig, build_augmentations
 from .dataloaders import build_dataloaders, build_inference_dataset
-from .location_embed import (
-    FourierEmbedding,
-    LocationEmbedding,
-    MLPEmbedding,
-    PolynomialFourier,
-)
+from .location_embed import (FourierEmbedding, LocationEmbedding, MLPEmbedding,
+                             PolynomialFourier)
 from .scorers import CosineSimilarityScorer, MLPScorer, Scorer
 
 

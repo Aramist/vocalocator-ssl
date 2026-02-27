@@ -1,3 +1,4 @@
+import sys
 import typing as tp
 
 import lightning as L
@@ -44,6 +45,19 @@ class LVocalocator(L.LightningModule):
             "temperature_adjustment": 1.0,  # For calibration
         }
         self.entropy_coeff = config["optimization"].get("entropy_coeff", 1.0)
+
+        self.use_animal_identity: bool = config["use_animal_identity"]
+        if self.use_animal_identity:
+            num_animals = 2
+            animal_identity_embedding = torch.zeros(
+                (num_animals, self.config["location_embedding_params"]["d_embedding"]),
+                dtype=torch.float32,
+            )
+            torch.nn.init.xavier_uniform_(animal_identity_embedding)
+            self.register_parameter(
+                "animal_identity_embedding",
+                torch.nn.Parameter(animal_identity_embedding, requires_grad=True),
+            )
 
         self.register_buffer(
             "minibatch_idx", torch.tensor(0, dtype=torch.long), persistent=True
@@ -140,6 +154,10 @@ class LVocalocator(L.LightningModule):
         audio_embedding = self.audio_encoder(audio)
         # location_embeddings: (bsz, 1+num_negative, num_animals, l_features)
         location_embedding = self.location_encoder(labels)
+        if self.use_animal_identity:
+            location_embedding = (
+                location_embedding + self.animal_identity_embedding[None, None, :, :]
+            )
 
         # Make audio embeddings broadcastable
         audio_embedding = audio_embedding[:, None, None, :].expand(
@@ -296,6 +314,18 @@ class LVocalocator(L.LightningModule):
 
         audio_embeddings = self.audio_encoder(audio)  # (b, feats)
         location_embeddings = self.location_encoder(labels)  # (b, n_animals, feats)
+        if self.use_animal_identity:
+            num_animals = self.animal_identity_embedding.shape[0]
+            if location_embeddings.shape[1] == num_animals:
+                # Make use of animal identity
+                location_embeddings = (
+                    location_embeddings + self.animal_identity_embedding[None, :, :]
+                )
+            else:
+                print(
+                    f"Warning: location embeddings have {location_embeddings.shape[1]} animals but animal identity embedding has {num_animals} animals. Skipping animal identity embedding.",
+                    file=sys.stderr,
+                )
         audio_embeddings = audio_embeddings[:, None, :].expand(
             *location_embeddings.shape[:-1],
             -1,  # d_audio_embed not necessarily equal to d_loc_embed
@@ -393,7 +423,9 @@ class LVocalocator(L.LightningModule):
                 indexing="ij",
             ),  # returns tuple x,y with coords (x,y)
             axis=-1,
-        ).transpose(1, 0, 2)  # (n_y, n_x, 3)
+        ).transpose(
+            1, 0, 2
+        )  # (n_y, n_x, 3)
         head_location = torch.from_numpy(head_location).float().to(labels.device)
 
         # Get the nose location grid from the head locations and the animal directions
@@ -532,7 +564,9 @@ class LVocalocator(L.LightningModule):
                 indexing="ij",
             ),  # returns tuple x,y,z with coords (x,y,z)
             axis=-1,
-        ).transpose(2, 1, 0, 3)  # (n_z, n_y, n_x, 3)
+        ).transpose(
+            2, 1, 0, 3
+        )  # (n_z, n_y, n_x, 3)
         head_location = torch.from_numpy(head_location).float().to(labels.device)
 
         # Combine get the nose location from the head location and the animal direction

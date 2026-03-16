@@ -46,11 +46,14 @@ class LVocalocator(L.LightningModule):
         }
         self.entropy_coeff = config["optimization"].get("entropy_coeff", 1.0)
 
-        self.use_animal_identity: bool = config["use_animal_identity"]
+        self.use_animal_identity: bool = config.get("use_animal_identity", True)
         if self.use_animal_identity:
-            num_animals = 2
+            num_animals_expected = self.config["dataloader"]["num_animals"]
             animal_identity_embedding = torch.zeros(
-                (num_animals, self.config["location_embedding_params"]["d_embedding"]),
+                (
+                    num_animals_expected,
+                    self.config["location_embedding_params"]["d_embedding"],
+                ),
                 dtype=torch.float32,
             )
             torch.nn.init.xavier_uniform_(animal_identity_embedding)

@@ -457,7 +457,7 @@ class SingleVocalizationDataset(Dataset):
             torch.Tensor: Animal poses for the negative frame. Shape: (n_requested, n_animals, n_nodes, n_dims)
         """
         if n == 0:
-            n_animals, n_nodes, n_dims = self.__label_for_index(idx).shape
+            n_animals, n_nodes, n_dims = self.__label_for_index(idx)[0].shape
             return torch.empty((0, n_animals, n_nodes, n_dims)), torch.empty(
                 (0, n_animals), dtype=torch.long
             )

@@ -425,6 +425,7 @@ class LVocalocator(L.LightningModule):
         """
         audio = batch["audio"]
         labels = batch["labels"]
+        animal_ids = batch.get("animal_ids", None)
         if len(audio.shape) == 2:
             audio = audio.unsqueeze(0)  # Create batch dim
         if len(labels.shape) == 4:
@@ -436,12 +437,10 @@ class LVocalocator(L.LightningModule):
         audio_embeddings = self.audio_encoder(audio)  # (b, feats)
         location_embeddings = self.location_encoder(labels)  # (b, n_animals, feats)
         if self.use_animal_identity:
-            num_animals = self.animal_identity_embedding.shape[0]
-            if location_embeddings.shape[1] == num_animals:
+            num_animals = self.animal_id_embedding.animal_identity_embedding.shape[0]
+            if location_embeddings.shape[1] == num_animals and animal_ids is not None:
                 # Make use of animal identity
-                location_embeddings = (
-                    location_embeddings + self.animal_identity_embedding[None, :, :]
-                )
+                location_embeddings = self.animal_id_embedding(location_embeddings, animal_ids)
             else:
                 print(
                     f"Warning: location embeddings have {location_embeddings.shape[1]} animals but animal identity embedding has {num_animals} animals. Skipping animal identity embedding.",

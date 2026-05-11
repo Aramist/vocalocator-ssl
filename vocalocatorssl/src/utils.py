@@ -545,6 +545,5 @@ def tensor_to_dict(tensor: torch.Tensor) -> dict:
     if np.all(json_bytes == 0):
         return {}
     json_str = json_bytes.decode("utf-8").rstrip("\x00")
-    print("Decoded JSON string: ", json_str)
     d = json.loads(json_str)
     return d

@@ -433,6 +433,7 @@ class LVocalocator(L.LightningModule):
 
         if not self.flags["predict_calibrate_mode"]:
             labels = labels.squeeze(1)  # Assume no negatives
+            animal_ids = animal_ids.squeeze(1) if animal_ids is not None else None
 
         audio_embeddings = self.audio_encoder(audio)  # (b, feats)
         location_embeddings = self.location_encoder(labels)  # (b, n_animals, feats)

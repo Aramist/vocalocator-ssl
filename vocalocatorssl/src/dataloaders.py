@@ -62,6 +62,7 @@ def collate(batch) -> dict[str, torch.Tensor]:
 
     # Audio should end up with shape (batch, channels, time)
     # Labels should end up with shape (batch, 1 + num_false, n_animals, n_nodes, n_dims)
+    # Animal ids should end up with shape (batch, 1 + num_false, n_animals) if they are available
     return {"audio": audio, "labels": labels, "animal_ids": animal_ids}
 
 

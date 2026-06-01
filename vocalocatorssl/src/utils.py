@@ -524,9 +524,9 @@ def dict_to_tensor(d: dict, pad_to: int | None = None) -> torch.Tensor:
         torch.Tensor: Byte tensor
     """
     for k, v in list(d.items()):
-        if not isinstance(k, int) or not isinstance(v, int):
+        if not isinstance(k, str) or not isinstance(v, int):
             del d[k]
-            d[int(k)] = int(v)
+            d[str(k)] = int(v)
     json_str = json.dumps(d)
     json_bytes = json_str.encode("utf-8")
     np_bytes = np.frombuffer(json_bytes, dtype=np.uint8).copy()

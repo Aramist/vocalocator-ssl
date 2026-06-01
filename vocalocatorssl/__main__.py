@@ -60,6 +60,7 @@ def make_trainer(config: dict, save_directory: Path, **kwargs) -> L.Trainer:
             callbacks.LearningRateMonitor(logging_interval="epoch"),
         ],
         gradient_clip_val=1.0 if config["optimization"]["clip_gradients"] else None,
+        num_sanity_val_steps=0,  # breaks the animal id buffer
         # limit_train_batches=10,
         # limit_val_batches=1,
         # max_epochs=1,

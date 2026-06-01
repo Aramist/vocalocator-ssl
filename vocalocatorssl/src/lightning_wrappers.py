@@ -36,6 +36,7 @@ class BufferCounterDict(torch.nn.Module):
             torch.zeros(BufferCounterDict.BUFFER_SIZE, dtype=torch.uint8),
             persistent=True,
         )
+        self.is_frozen = False
 
     def load_buffer(self):
         if self.active_buffer:
@@ -56,8 +57,11 @@ class BufferCounterDict(torch.nn.Module):
         return len(self.active_buffer)
 
     def __getitem__(self, key):
+        key = str(key)
         self.load_buffer()
         if key not in self:
+            if self.is_frozen:
+                raise KeyError(f"Key {key} not found in buffer and buffer is frozen.")
             self[key] = len(self)
         return self.active_buffer[key]
 
@@ -68,10 +72,12 @@ class BufferCounterDict(torch.nn.Module):
         elif not isinstance(value, int):
             value = int(value)
 
+        key = str(key)
         self.active_buffer[key] = value
         self.save_buffer()
 
     def __contains__(self, key):
+        key = str(key)
         return key in self.active_buffer
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -105,6 +111,19 @@ class AnimalIdentityEmbedding(torch.nn.Module):
         )
         # Helps map the animal ids in the dataset to a 0-indexed counter into the embedding
         self.animal_id_lookup = BufferCounterDict()
+
+    def freeze(self):
+        self.animal_id_lookup.is_frozen = True
+
+    def eval(self):
+        super().eval()
+        self.freeze()
+        return self
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.animal_id_lookup.is_frozen = not mode
+        return self
 
     def forward(
         self, location_embedding: torch.Tensor, animal_ids: torch.Tensor | None
@@ -441,7 +460,9 @@ class LVocalocator(L.LightningModule):
             num_animals = self.animal_id_embedding.animal_identity_embedding.shape[0]
             if location_embeddings.shape[1] == num_animals and animal_ids is not None:
                 # Make use of animal identity
-                location_embeddings = self.animal_id_embedding(location_embeddings, animal_ids)
+                location_embeddings = self.animal_id_embedding(
+                    location_embeddings, animal_ids
+                )
             else:
                 print(
                     f"Warning: location embeddings have {location_embeddings.shape[1]} animals but animal identity embedding has {num_animals} animals. Skipping animal identity embedding.",

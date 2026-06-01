@@ -50,6 +50,7 @@ def get_default_config() -> dict:
         },
         # Valid scorers: cosinesim, mlp
         "use_animal_identity": True,
+        "animal_identity_prob": 0.5,  # Probability of incorporating animal ID in a given training example
         "score_function_type": "cosinesim",
         "score_function_params": {},
         "dataloader": {

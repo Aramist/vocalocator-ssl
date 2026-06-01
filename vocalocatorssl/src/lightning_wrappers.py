@@ -97,7 +97,7 @@ class BufferCounterDict(torch.nn.Module):
 
 
 class AnimalIdentityEmbedding(torch.nn.Module):
-    def __init__(self, num_animals: int, d_embedding: int):
+    def __init__(self, num_animals: int, d_embedding: int, animal_id_prob: float = 1.0):
         super().__init__()
         self.is_active = True
         animal_identity_embedding = torch.zeros(
@@ -111,6 +111,8 @@ class AnimalIdentityEmbedding(torch.nn.Module):
         )
         # Helps map the animal ids in the dataset to a 0-indexed counter into the embedding
         self.animal_id_lookup = BufferCounterDict()
+        self.prob = animal_id_prob
+        print(f"probability of using animal identity embedding: {self.prob}")
 
     def freeze(self):
         self.animal_id_lookup.is_frozen = True
@@ -143,7 +145,19 @@ class AnimalIdentityEmbedding(torch.nn.Module):
         animal_id_indices = self.animal_id_lookup(animal_ids)
         animal_id_embs = torch.index_select(
             self.animal_identity_embedding, 0, animal_id_indices.view(-1)
-        ).reshape(*animal_id_indices.shape, self.animal_identity_embedding.shape[1])
+        ).reshape(
+            *animal_id_indices.shape, self.animal_identity_embedding.shape[1]
+        )  # (*batch, num_animals, d_embed)
+        if self.training:
+            random_mask = (
+                torch.rand(
+                    *animal_id_indices.shape[:-1], device=animal_id_indices.device
+                )
+                < self.prob
+            )  # (*batch)
+            animal_id_embs = (
+                random_mask[..., None, None] * animal_id_embs
+            )  # Zero out some animal ID embeddings during training with probability (1 - self.prob)
         return location_embedding + animal_id_embs
 
     def deactivate(self):
@@ -184,7 +198,9 @@ class LVocalocator(L.LightningModule):
             "d_embedding"
         ]
         self.animal_id_embedding = AnimalIdentityEmbedding(
-            num_animals=num_animals_expected, d_embedding=animal_id_embedding_dim
+            num_animals=num_animals_expected,
+            d_embedding=animal_id_embedding_dim,
+            animal_id_prob=config.get("animal_identity_prob", 1.0),
         )
         if not self.use_animal_identity:
             self.animal_id_embedding.is_active = False

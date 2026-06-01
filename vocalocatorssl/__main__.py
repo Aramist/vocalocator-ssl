@@ -5,6 +5,7 @@ import typing as tp
 from pathlib import Path
 
 import lightning as L
+from lightning.pytorch.loggers import WandbLogger
 import numpy as np
 import torch
 from lightning.pytorch import callbacks
@@ -80,7 +81,11 @@ def train_default(
 
     default_cfg = utilsmodule.get_default_config()
     config = utilsmodule.update_recursively(config, default_cfg)
-    trainer = make_trainer(config, save_directory)
+    trainer = make_trainer(
+        config,
+        save_directory,
+        logger=WandbLogger(project="vocalocatorssl", save_dir=save_directory),
+    )
 
     train_dloader, val_dloader, test_dloader = utilsmodule.initialize_dataloaders(
         config, data_path, index_path=index_dir, rank=trainer.global_rank

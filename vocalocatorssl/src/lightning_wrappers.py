@@ -42,6 +42,7 @@ class LVocalocator(L.LightningModule):
             "predict_calibrate_mode": False,
             "predict_gen_pmfs": False,
             "temperature_adjustment": 1.0,  # For calibration
+            "predict_return_embeddings": False,
         }
         self.entropy_coeff = config["optimization"].get("entropy_coeff", 1.0)
 
@@ -268,10 +269,7 @@ class LVocalocator(L.LightningModule):
 
     def predict_step(
         self, batch: dict[str, torch.Tensor], *args: tp.Any
-    ) -> (
-        tuple[torch.Tensor, torch.Tensor]
-        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-    ):
+    ) -> dict[str, torch.Tensor]:
         """Computes score distributions for each candidate source location for each
         sound in the batch.
 
@@ -281,8 +279,11 @@ class LVocalocator(L.LightningModule):
                 locations are expected to have shape (batch, num_negative + 1, num_animals, num_nodes, num_dims)
 
         Returns:
-            torch.Tensor: Labels provided as input
-            torch.Tensor: Scores for each animal (batch, n_animals)
+            Dict with keys:
+            labels: Labels provided as input
+            scores: Scores for each animal (batch, n_animals)
+            pmfs: (Optional) Probability distributions over arena for each sound in the batch (batch, num_theta, num_y, num_x)
+            audio_embeddings: (Optional) Audio embeddings for each sound in the batch (batch, audio_embedding_dim)
         """
         audio = batch["audio"]
         labels = batch["labels"]
@@ -310,12 +311,21 @@ class LVocalocator(L.LightningModule):
         if self.flags["predict_calibrate_mode"]:
             scores = torch.logsumexp(scores, dim=-1)  # sum over animals
 
+        output = {
+            "labels": labels,
+            "scores": scores,
+        }
+
         if self.flags["predict_gen_pmfs"]:
             # Generate PMFs for each animal
             pmfs = self.make_pmf(batch)
-            return labels, scores, pmfs
+            output["pmfs"] = pmfs
 
-        return labels, scores
+        if self.flags["predict_return_embeddings"]:
+            # unexpand audio embeddings to remove redundant data
+            output["audio_embeddings"] = audio_embeddings[:, 0, :]
+
+        return output
 
     def make_pmf(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         """Computes score distributions for each candidate source location for each
@@ -393,7 +403,9 @@ class LVocalocator(L.LightningModule):
                 indexing="ij",
             ),  # returns tuple x,y with coords (x,y)
             axis=-1,
-        ).transpose(1, 0, 2)  # (n_y, n_x, 3)
+        ).transpose(
+            1, 0, 2
+        )  # (n_y, n_x, 3)
         head_location = torch.from_numpy(head_location).float().to(labels.device)
 
         # Get the nose location grid from the head locations and the animal directions
@@ -532,7 +544,9 @@ class LVocalocator(L.LightningModule):
                 indexing="ij",
             ),  # returns tuple x,y,z with coords (x,y,z)
             axis=-1,
-        ).transpose(2, 1, 0, 3)  # (n_z, n_y, n_x, 3)
+        ).transpose(
+            2, 1, 0, 3
+        )  # (n_z, n_y, n_x, 3)
         head_location = torch.from_numpy(head_location).float().to(labels.device)
 
         # Combine get the nose location from the head location and the animal direction

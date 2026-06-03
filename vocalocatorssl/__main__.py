@@ -123,6 +123,45 @@ def train_default(
         os.symlink(best_ckpt, save_directory / "best.ckpt")
 
 
+def concatenate_by_session(
+    list_of_dicts: tp.Sequence[dict[str, torch.Tensor]],
+    session_names: list[str],
+    session_lengths: list[int],
+) -> dict[str, np.ndarray]:
+    """Concatenates a list of dictionaries containing tensors along the first dimension, grouped by session.
+
+    Args:
+        list_of_dicts (tp.Sequence[dict[str, torch.Tensor]]): List of dictionaries to concatenate.
+        session_names (list[str]): List of session names corresponding to each dictionary. Will be used to name output arrays
+        session_lengths (list[int]): List of lengths for each session, used to split concatenated arrays.
+
+    Returns:
+        dict[str, np.ndarray]: Dictionary containing concatenated arrays for each key.
+    """
+    keys = list(list_of_dicts[0].keys())
+    output = {}
+
+    # Arrays belonging to different sessions may have different shapes
+    # But all elements of a batch are guaranteed to belong to the same session
+    batch_lengths = [d[keys[0]].shape[0] for d in list_of_dicts]
+    cum_lengths = np.insert(np.cumsum(batch_lengths), 0, 0)
+    start_idx = 0
+    for n, length in enumerate(session_lengths):
+        end_idx = start_idx + 1
+        while cum_lengths[end_idx] - cum_lengths[start_idx] < length:
+            end_idx += 1
+        # Grab from start_idx to end_idx inclusive
+        for key in keys:
+            output_key = f"{session_names[n]}-{key}"
+            output[output_key] = np.concatenate(
+                [d[key].cpu().numpy() for d in list_of_dicts[start_idx:end_idx]],
+                axis=0,
+            )
+        start_idx = end_idx
+
+    return output
+
+
 def inference(
     data_path: Path,
     save_directory: Path,
@@ -131,6 +170,7 @@ def inference(
     index_file: tp.Optional[Path] = None,
     calibrate_mode: bool = False,
     make_pmfs: bool = False,
+    return_embeddings: bool = False,
     temperature_adjustment: float = 1.0,
 ):
     """Runs inference on a dataset using the trained model located at `save_directory`.
@@ -145,6 +185,7 @@ def inference(
             the model's accuracy will be evaluated against many negative samples.
         make_pmfs (bool, optional): If True, the model will generate probability mass functions (PMFs) for each prediction.
             Defaults to False.
+        return_embeddings (bool, optional): If True, the model will return audio embeddings for each sound. Defaults to False.
         temperature_adjustment (float, optional): Temperature adjustment for calibration. Defaults to 1.0.
 
     Raises:
@@ -190,62 +231,29 @@ def inference(
         calibrate_mode  # Hack to pass args into predict_step
     )
     model.flags["predict_gen_pmfs"] = make_pmfs
+    model.flags["predict_return_embeddings"] = return_embeddings
     model.flags["temperature_adjustment"] = temperature_adjustment
-    preds: tp.Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = (
-        trainer.predict(
-            model,
-            dloader,
-            return_predictions=True,
-            ckpt_path=newest_checkpoint,  # probably unnecessary
-        )
+    preds: tp.Sequence[dict[str, torch.Tensor]] = trainer.predict(
+        model,
+        dloader,
+        return_predictions=True,
+        ckpt_path=newest_checkpoint,  # probably unnecessary
     )
-
-    labels = [x[0].cpu().numpy() for x in preds]
-    scores = [x[1].cpu().numpy() for x in preds]
 
     dset: PluralVocalizationDataset = dloader.dataset
     filenames = dset.filenames
     dset_lengths = dset.lengths
+    archive = concatenate_by_session(preds, filenames, dset_lengths)
+    archive["dataset_order"] = list(map(str.encode, filenames))
 
-    # Concatenate predictions and labels within each dataset
-    labels_by_dataset = []
-    scores_by_dataset = []
-    for length in dset_lengths:
-        accum_labels = []
-        accum_scores = []
-        while sum(len(arr) for arr in accum_labels) < length:
-            # Get the next batch of labels
-            accum_labels.append(labels.pop(0))
-            accum_scores.append(scores.pop(0))
-        labels_by_dataset.append(np.concatenate(accum_labels, axis=0))
-        scores_by_dataset.append(np.concatenate(accum_scores, axis=0))
-
-    labels = {
-        f"{dataset_name}-labels": labels
-        for dataset_name, labels in zip(filenames, labels_by_dataset)
-    }
-    scores = {
-        f"{dataset_name}-scores": scores
-        for dataset_name, scores in zip(filenames, scores_by_dataset)
-    }
-
-    dataset_order = list(map(str.encode, filenames))
-
-    if make_pmfs:
-        pmfs = [x[2] for x in preds]
-        pmfs = torch.cat(pmfs, dim=0).cpu().numpy()  # These all have the same shape
-        np.savez(
-            output_path, pmfs=pmfs, **labels, **scores, dataset_order=dataset_order
-        )
-    else:
-        np.savez(output_path, **labels, **scores, dataset_order=dataset_order)
+    np.savez(output_path, **archive)
 
     if calibrate_mode:
         # Compute and report confidence
         # in calibrate mode the num_animal dimensions is reduced out
         # scores should have shape (N, num_negative + 1)
         scores_concat = np.concatenate(
-            [scores[f"{dataset_name}-scores"] for dataset_name in filenames], axis=0
+            [archive[f"{dataset_name}-scores"] for dataset_name in filenames], axis=0
         )
         cal_bins, calibration_curve = utilsmodule.compute_calibration(scores_concat)
         with open(save_directory / "calibration.txt", "w") as ctx:
@@ -291,6 +299,11 @@ if __name__ == "__main__":
         "--gen-pmfs", action="store_true", help="Generate PMFs in --predict mode"
     )
     ap.add_argument(
+        "--return-embeddings",
+        action="store_true",
+        help="Return audio embeddings for each sound in addition to predictions. Only applicable in --predict mode and will be ignored if --calibrate is set.",
+    )
+    ap.add_argument(
         "--temp-adjustment",
         type=float,
         default=1.0,
@@ -311,6 +324,9 @@ if __name__ == "__main__":
         config = None
     else:
         # config cannot be none during training
+        print(
+            "Warning: No config provided, using default values for training. This will be overridden if a pretrained model is loaded."
+        )
         config = {}  # will be filled with default values
 
     if args.save_path is None:
@@ -331,6 +347,7 @@ if __name__ == "__main__":
             output_path=output_path,
             make_pmfs=args.gen_pmfs,
             temperature_adjustment=args.temp_adjustment,
+            return_embeddings=args.return_embeddings,
         )
     elif args.calibrate:
         inference(

@@ -5,10 +5,10 @@ import typing as tp
 from pathlib import Path
 
 import lightning as L
-from lightning.pytorch.loggers import WandbLogger
 import numpy as np
 import torch
 from lightning.pytorch import callbacks
+from lightning.pytorch.loggers import WandbLogger
 
 from .src import utils as utilsmodule
 from .src.dataloaders import PluralVocalizationDataset

@@ -1,0 +1,57 @@
+command:
+- ${env}
+- ${interpreter}
+- -m
+- vocalocatorssl
+- --config
+- ${args_json_file}
+- --sweep
+method: bayes
+metric:
+  goal: maximize
+  name: uncalibrated_prop_assignable
+parameters:
+  optimization:
+    parameters:
+      num_weight_updates:
+        distribution: constant
+        value: 150000
+      momentum:
+        distribution: constant
+        value: 0.8
+      initial_learning_rate:
+        distribution: constant
+        value: 0.01
+  architecture:
+    distribution: constant
+    value: conformer
+  model_params:
+    parameters:
+      resnet_num_blocks:
+        distribution: categorical
+        values: [4, 6, 8, 10, 12]
+      resnet_conv_channels:
+        distribution: categorical
+        values: [32, 64, 128, 256]
+      d_embedding:
+        distribution: categorical
+        values: [32, 64, 128, 256]
+      conformer_num_layers:
+        distribution: categorical
+        values: [2, 4, 8, 12, 16]
+  dataloader:
+    parameters:
+      num_negative_samples:
+        distribution: constant
+        value: 19
+  augmentations:
+    parameters:
+      mask_channels_min_channels:
+        distribution: constant
+        value: 6
+      mask_channels_max_channels:
+        distribution: constant
+        value: 12
+
+program: __main__.py
+run_cap: 100

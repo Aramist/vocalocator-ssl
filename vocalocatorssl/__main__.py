@@ -277,7 +277,6 @@ if __name__ == "__main__":
     ap.add_argument(
         "--data",
         type=Path,
-        required=True,
         help="Path to dataset or directory containing datasets.",
     )
     ap.add_argument(
@@ -322,6 +321,11 @@ if __name__ == "__main__":
         default=None,
         help="Path to save predictions or calibration output.",
     )
+    ap.add_argument(
+        "--sweep",
+        action="store_true",
+        help="Flag to indicate this script is being run as part of a hyperparameter sweep. Changes the semantics of --save-path to generate a randomly named directory",
+    )
     args = ap.parse_args()
     if args.config is not None:
         # If we have a config, use it to override defualts / pretrain config
@@ -339,6 +343,28 @@ if __name__ == "__main__":
         args.save_path = Path(".")
 
     args.save_path = args.save_path.resolve()
+
+    if args.sweep:
+        if save_dir := os.environ.get("SWEEP_SAVE_DIR", None):
+            args.save_path = Path(save_dir).resolve()
+        else:
+            raise ValueError(
+                "SWEEP_SAVE_DIR environment variable must be set when running in sweep mode."
+            )
+        if data_path := os.environ.get("DATA_PATH", None):
+            args.data = Path(data_path)
+        else:
+            raise ValueError(
+                "DATA_PATH environment variable must be set when running in sweep mode."
+            )
+
+        while (save_path := args.save_path / os.urandom(4).hex()).exists():
+            pass
+        args.save_path = save_path
+        args.save_path.mkdir()
+
+    if args.data is None:
+        raise ValueError("Data path must be provided with --data")
 
     output_path = (
         args.output_path

@@ -11,8 +11,12 @@ from torch.utils.data import DataLoader
 from .audio_embed import AudioEmbedder, ResnetConformer, SimpleNet
 from .augmentations import AugmentationConfig, build_augmentations
 from .dataloaders import build_dataloaders, build_inference_dataset
-from .location_embed import (FourierEmbedding, LocationEmbedding, MLPEmbedding,
-                             PolynomialFourier)
+from .location_embed import (
+    FourierEmbedding,
+    LocationEmbedding,
+    MLPEmbedding,
+    PolynomialFourier,
+)
 from .scorers import CosineSimilarityScorer, MLPScorer, Scorer
 
 
@@ -27,45 +31,51 @@ def get_default_config() -> dict:
             "clip_gradients": True,
             "initial_learning_rate": 0.003,
             "initial_temperature": 1.0,
-            "final_temperature": 0.1,
+            "final_temperature": 1.0,
             "num_temperature_steps": 100_000,
             "temperature_schedule": "linear",  # linear, exponential
-            "entropy_coeff": 1.0,  # Coefficient for the entropy loss
+            "entropy_coeff": 0.0,  # Coefficient for the entropy loss
         },
         # Valid architectures: simplenet, conformer
         "architecture": "simplenet",
         "model_params": {
             "d_embedding": 128,
         },
-        # Valid location embedding types: fourier, mlp
-        "location_embedding_type": "fourier",
+        # Valid location embedding types: fourier, mlp, poly-fourier
+        "location_embedding_type": "poly-fourier",
         "location_embedding_params": {
-            "d_embedding": 128,
-            "init_bandwidth": 0.1,
-            "multinode_strategy": "absolute",
+            "d_embedding": 256,
+            "xy_poly_degree": 5,
+            "z_poly_degree": 2,
+            "angle_fourier_degree": 64,
+            "d_hidden": 256,
+            "num_layers": 2,
+            "multinode_strategy": "relative",
+            "init_bandwidth": 0.3,
         },
-        # Valid scorers: cosinesim, mlp
         "use_animal_identity": True,
-        "score_function_type": "cosinesim",
-        "score_function_params": {},
+        # Valid scorers: cosinesim, mlp
+        "score_function_type": "mlp",
+        "score_function_params": {"d_hidden": 128, "num_layers": 2},
         "dataloader": {
             "num_microphones": 24,
+            "num_animals": 2,
             "crop_length": 8192,
             "arena_dims": [615, 615, 425],
             "arena_dims_units": "mm",
             "normalize_data": True,
             "nodes_to_load": ["Nose", "Head"],
-            "batch_size": 128,
+            "batch_size": 32,
             "num_negative_samples": 1,
-            "min_difficulty": -1,
-            "max_difficulty": 1,
-            "num_difficulty_steps": 1000,
+            "min_difficulty": None,
+            "max_difficulty": None,
+            "num_difficulty_steps": None,
         },
         "augmentations": {
             "should_use_augmentations": True,
             "mask_temporal_prob": 0.5,
-            "mask_temporal_min_length": 512,
-            "mask_temporal_max_length": 2048,
+            "mask_temporal_min_length": 0.25,
+            "mask_temporal_max_length": 0.5,
             "mask_channels_prob": 0.5,
             "mask_channels_min_channels": 1,
             "mask_channels_max_channels": 12,

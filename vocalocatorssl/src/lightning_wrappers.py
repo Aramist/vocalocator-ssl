@@ -801,7 +801,7 @@ class LVocalocator(L.LightningModule):
             is_finetuning=self.is_finetuning,
         )
         sched = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer=optimizer, patience=50, factor=0.5, mode="min"
+            optimizer=optimizer, patience=5, factor=0.5, mode="min"
         )
 
         return {

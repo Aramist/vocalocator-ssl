@@ -1,16 +1,12 @@
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
 [project]
-name = "vocalocatorssl"
-version = "1.0.0"
+name = "vocalocator-ssl"
+version = "1.1.0"
 authors = [
-  { name="NeuroStats Lab" },
+    { name="NeuroStats Lab" },
 ]
 description = "Tool for weakly-supervised sound-source localization of vocal calls"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -18,13 +14,13 @@ classifiers = [
 ]
 license = "MIT"
 dependencies = [
-    "h5py>=3.9.0",
-    "matplotlib>=3.8.0",
-    "numpy>=1.24.0",
-    "pyjson5>=1.6.0",
-    "scipy>=1.11.0",
-    "torch>=2.0.0",
-    "lightning>=2.4.0",
+    "h5py>=3.16.0",
+    "lightning>=2.6.5",
+    "numpy>=2.4.6",
+    "pyjson5>=2.0.1",
+    "scipy>=1.17.1",
+    "torch>=2.13.0",
+    "torchaudio>=2.11.0",
 ]
 
 [project.urls]

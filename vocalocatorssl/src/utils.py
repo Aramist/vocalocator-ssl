@@ -1,20 +1,18 @@
+import json
 import typing as tp
 from pathlib import Path
 
 import numpy as np
 import pyjson5
+import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
 
 from .audio_embed import AudioEmbedder, ResnetConformer, SimpleNet
 from .augmentations import AugmentationConfig, build_augmentations
 from .dataloaders import build_dataloaders, build_inference_dataset
-from .location_embed import (
-    FourierEmbedding,
-    LocationEmbedding,
-    MLPEmbedding,
-    PolynomialFourier,
-)
+from .location_embed import (FourierEmbedding, LocationEmbedding, MLPEmbedding,
+                             PolynomialFourier)
 from .scorers import CosineSimilarityScorer, MLPScorer, Scorer
 
 
@@ -47,6 +45,7 @@ def get_default_config() -> dict:
             "multinode_strategy": "absolute",
         },
         # Valid scorers: cosinesim, mlp
+        "use_animal_identity": True,
         "score_function_type": "cosinesim",
         "score_function_params": {},
         "dataloader": {
@@ -508,3 +507,39 @@ def compute_calibration(
 
     bin_center = 0.5 * (p_bins[:-1] + p_bins[1:])  # (num_bins, )
     return bin_center, bin_acc
+
+
+def dict_to_tensor(d: dict, pad_to: int | None = None) -> torch.Tensor:
+    """Converts a dictionary into a byte array that can be stored in
+    a torch state dict.
+
+    Args:
+        d (dict): Dictionary of Python integer keys and values
+
+    Returns:
+        torch.Tensor: Byte tensor
+    """
+    for k, v in list(d.items()):
+        if not isinstance(k, str) or not isinstance(v, int):
+            del d[k]
+            d[str(k)] = int(v)
+    json_str = json.dumps(d)
+    json_bytes = json_str.encode("utf-8")
+    np_bytes = np.frombuffer(json_bytes, dtype=np.uint8).copy()
+    if pad_to is not None:
+        if len(np_bytes) > pad_to:
+            raise ValueError(
+                f"Byte representation of dictionary is too large to fit in the specified size of {pad_to} bytes."
+            )
+        np_bytes = np.pad(np_bytes, (0, pad_to - len(np_bytes)), constant_values=0)
+    byte_tensor = torch.from_numpy(np_bytes)
+    return byte_tensor
+
+
+def tensor_to_dict(tensor: torch.Tensor) -> dict:
+    json_bytes = tensor.detach().cpu().numpy().tobytes()
+    if np.all(json_bytes == 0):
+        return {}
+    json_str = json_bytes.decode("utf-8").rstrip("\x00")
+    d = json.loads(json_str)
+    return d

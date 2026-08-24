@@ -1,9 +1,11 @@
+import sys
 import typing as tp
 
 import lightning as L
 import numpy as np
 import torch
 from torch import optim
+from torch.nn import functional as F
 from torchmetrics.classification import MulticlassAccuracy
 
 from . import utils
@@ -18,6 +20,137 @@ def info_nce(
     return torch.logsumexp(logits, dim=1).mean(dim=0) - logits.gather(
         dim=1, index=labels.unsqueeze(1)
     ).mean(dim=0)
+
+
+class BufferCounterDict(torch.nn.Module):
+    BUFFER_SIZE = 128
+    persistent_buffer: torch.Tensor | None
+    active_buffer: dict[int, int] | None
+
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.active_buffer = {}
+        self.active_buffer.update(kwargs)
+        self.register_buffer(
+            "persistent_buffer",
+            torch.zeros(BufferCounterDict.BUFFER_SIZE, dtype=torch.uint8),
+            persistent=True,
+        )
+        self.is_frozen = False
+
+    def load_buffer(self):
+        if self.active_buffer:
+            return
+        if torch.all(self.persistent_buffer == 0):
+            return
+
+        self.active_buffer = utils.tensor_to_dict(self.persistent_buffer)
+
+    def save_buffer(self):
+        data = utils.dict_to_tensor(
+            self.active_buffer, pad_to=BufferCounterDict.BUFFER_SIZE
+        )
+        self.persistent_buffer = data
+
+    def __len__(self):
+        self.load_buffer()
+        return len(self.active_buffer)
+
+    def __getitem__(self, key):
+        key = str(key)
+        self.load_buffer()
+        if key not in self:
+            if self.is_frozen:
+                raise KeyError(f"Key {key} not found in buffer and buffer is frozen.")
+            self[key] = len(self)
+        return self.active_buffer[key]
+
+    def __setitem__(self, key, value):
+        self.load_buffer()
+        if isinstance(value, torch.Tensor):
+            value = int(value.item())
+        elif not isinstance(value, int):
+            value = int(value)
+
+        key = str(key)
+        self.active_buffer[key] = value
+        self.save_buffer()
+
+    def __contains__(self, key):
+        key = str(key)
+        return key in self.active_buffer
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Maps every element in x to the value stored in self[x]
+
+        Args:
+            x (torch.Tensor): Tensor of keys to look up
+
+        Returns:
+            torch.Tensor: Tensor of values corresponding to the keys
+        """
+        with torch.no_grad():
+            output = torch.empty_like(x, dtype=torch.long)
+            for key in torch.unique(x):
+                output[x == key] = self[key.item()]
+        return output
+
+
+class AnimalIdentityEmbedding(torch.nn.Module):
+    def __init__(self, num_animals: int, d_embedding: int):
+        super().__init__()
+        self.is_active = True
+        animal_identity_embedding = torch.zeros(
+            (num_animals, d_embedding),
+            dtype=torch.float32,
+        )
+        torch.nn.init.xavier_uniform_(animal_identity_embedding)
+        self.register_parameter(
+            "animal_identity_embedding",
+            torch.nn.Parameter(animal_identity_embedding, requires_grad=True),
+        )
+        # Helps map the animal ids in the dataset to a 0-indexed counter into the embedding
+        self.animal_id_lookup = BufferCounterDict()
+
+    def freeze(self):
+        self.animal_id_lookup.is_frozen = True
+
+    def eval(self):
+        super().eval()
+        self.freeze()
+        return self
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.animal_id_lookup.is_frozen = not mode
+        return self
+
+    def forward(
+        self, location_embedding: torch.Tensor, animal_ids: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Applies animal ID embeddings to location embeddings
+
+        Args:
+            location_embedding (torch.Tensor): Location embeddings (*batch, num_animals, d_embed)
+            animal_ids (torch.Tensor | None): Animal IDs (*batch, num_animals)
+
+        Returns:
+            torch.Tensor: Location embeddings with animal identity added (*batch, num_animals, d_embed)
+        """
+        if not self.is_active or animal_ids is None:
+            return location_embedding
+
+        animal_id_indices = self.animal_id_lookup(animal_ids)
+        animal_id_embs = torch.index_select(
+            self.animal_identity_embedding, 0, animal_id_indices.view(-1)
+        ).reshape(*animal_id_indices.shape, self.animal_identity_embedding.shape[1])
+        return location_embedding + animal_id_embs
+
+    def deactivate(self):
+        self.is_active = False
+
+    def activate(self):
+        self.is_active = True
 
 
 class LVocalocator(L.LightningModule):
@@ -42,8 +175,20 @@ class LVocalocator(L.LightningModule):
             "predict_calibrate_mode": False,
             "predict_gen_pmfs": False,
             "temperature_adjustment": 1.0,  # For calibration
+            "predict_return_embeddings": False,
         }
         self.entropy_coeff = config["optimization"].get("entropy_coeff", 1.0)
+
+        self.use_animal_identity: bool = config.get("use_animal_identity", True)
+        num_animals_expected = self.config["dataloader"]["num_animals"]
+        animal_id_embedding_dim = self.config["location_embedding_params"][
+            "d_embedding"
+        ]
+        self.animal_id_embedding = AnimalIdentityEmbedding(
+            num_animals=num_animals_expected, d_embedding=animal_id_embedding_dim
+        )
+        if not self.use_animal_identity:
+            self.animal_id_embedding.is_active = False
 
         self.register_buffer(
             "minibatch_idx", torch.tensor(0, dtype=torch.long), persistent=True
@@ -108,13 +253,18 @@ class LVocalocator(L.LightningModule):
             self.finetunify()
 
     def forward(
-        self, audio: torch.Tensor, labels: torch.Tensor, shuffle: bool = True
+        self,
+        audio: torch.Tensor,
+        labels: torch.Tensor,
+        animal_ids: torch.Tensor | None,
+        shuffle: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Computes scores between audio and labels.
 
         Args:
             audio (torch.Tensor): Audio (batch, time, channels)
             labels (torch.Tensor): Labels (batch, 1+num_negative, animals, nodes, dims)
+            animal_ids (torch.Tensor): Animal IDs (batch, 1+num_negative, animals)
             shuffle (bool, optional): Whether labels are shuffled. Defaults to True.
 
         Returns:
@@ -131,6 +281,12 @@ class LVocalocator(L.LightningModule):
             cur_negatives = labels[torch.arange(bsz), positive_label_idx]
             labels[torch.arange(bsz), positive_label_idx] = labels[torch.arange(bsz), 0]
             labels[torch.arange(bsz), 0] = cur_negatives
+            if animal_ids is not None:
+                cur_negative_ids = animal_ids[torch.arange(bsz), positive_label_idx]
+                animal_ids[torch.arange(bsz), positive_label_idx] = animal_ids[
+                    torch.arange(bsz), 0
+                ]
+                animal_ids[torch.arange(bsz), 0] = cur_negative_ids
         else:
             positive_label_idx = torch.zeros(
                 bsz, dtype=torch.long, device=labels.device
@@ -140,6 +296,7 @@ class LVocalocator(L.LightningModule):
         audio_embedding = self.audio_encoder(audio)
         # location_embeddings: (bsz, 1+num_negative, num_animals, l_features)
         location_embedding = self.location_encoder(labels)
+        location_embedding = self.animal_id_embedding(location_embedding, animal_ids)
 
         # Make audio embeddings broadcastable
         audio_embedding = audio_embedding[:, None, None, :].expand(
@@ -171,10 +328,12 @@ class LVocalocator(L.LightningModule):
             torch.Tensor: Scalar loss value for this minibatch
         """
         temperature = self.compute_temperature()
-        audio, labels = batch["audio"], batch["labels"]
+        audio, labels, animal_ids = batch["audio"], batch["labels"], batch["animal_ids"]
         audio = self.augmentation_transform(audio)
 
-        scores, positive_scores, positive_label_index = self.forward(audio, labels)
+        scores, positive_scores, positive_label_index = self.forward(
+            audio, labels, animal_ids
+        )
         positive_probs = torch.softmax(
             positive_scores / temperature, dim=-1
         )  # (batch, num_animals)
@@ -231,11 +390,11 @@ class LVocalocator(L.LightningModule):
         Returns:
             torch.Tensor: Scalar accuracy value for this minibatch
         """
-        audio, labels = batch["audio"], batch["labels"]
+        audio, labels, animal_ids = batch["audio"], batch["labels"], batch["animal_ids"]
 
         # Shuffled to prevent weight explosion from inflating accuracy
         scores, positive_scores, positive_label_index = self.forward(
-            audio, labels, shuffle=True
+            audio, labels, animal_ids, shuffle=True
         )
         # pred: (batch, )
         metric = MulticlassAccuracy(num_classes=scores.shape[1], average="micro").to(
@@ -268,10 +427,7 @@ class LVocalocator(L.LightningModule):
 
     def predict_step(
         self, batch: dict[str, torch.Tensor], *args: tp.Any
-    ) -> (
-        tuple[torch.Tensor, torch.Tensor]
-        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-    ):
+    ) -> dict[str, torch.Tensor]:
         """Computes score distributions for each candidate source location for each
         sound in the batch.
 
@@ -281,11 +437,15 @@ class LVocalocator(L.LightningModule):
                 locations are expected to have shape (batch, num_negative + 1, num_animals, num_nodes, num_dims)
 
         Returns:
-            torch.Tensor: Labels provided as input
-            torch.Tensor: Scores for each animal (batch, n_animals)
+            Dict with keys:
+            labels: Labels provided as input
+            scores: Scores for each animal (batch, n_animals)
+            pmfs: (Optional) Probability distributions over arena for each sound in the batch (batch, num_theta, num_y, num_x)
+            audio_embeddings: (Optional) Audio embeddings for each sound in the batch (batch, audio_embedding_dim)
         """
         audio = batch["audio"]
         labels = batch["labels"]
+        animal_ids = batch.get("animal_ids", None)
         if len(audio.shape) == 2:
             audio = audio.unsqueeze(0)  # Create batch dim
         if len(labels.shape) == 4:
@@ -293,9 +453,22 @@ class LVocalocator(L.LightningModule):
 
         if not self.flags["predict_calibrate_mode"]:
             labels = labels.squeeze(1)  # Assume no negatives
+            animal_ids = animal_ids.squeeze(1) if animal_ids is not None else None
 
         audio_embeddings = self.audio_encoder(audio)  # (b, feats)
         location_embeddings = self.location_encoder(labels)  # (b, n_animals, feats)
+        if self.use_animal_identity:
+            num_animals = self.animal_id_embedding.animal_identity_embedding.shape[0]
+            if location_embeddings.shape[1] == num_animals and animal_ids is not None:
+                # Make use of animal identity
+                location_embeddings = self.animal_id_embedding(
+                    location_embeddings, animal_ids
+                )
+            else:
+                print(
+                    f"Warning: location embeddings have {location_embeddings.shape[1]} animals but animal identity embedding has {num_animals} animals. Skipping animal identity embedding.",
+                    file=sys.stderr,
+                )
         audio_embeddings = audio_embeddings[:, None, :].expand(
             *location_embeddings.shape[:-1],
             -1,  # d_audio_embed not necessarily equal to d_loc_embed
@@ -310,12 +483,21 @@ class LVocalocator(L.LightningModule):
         if self.flags["predict_calibrate_mode"]:
             scores = torch.logsumexp(scores, dim=-1)  # sum over animals
 
+        output = {
+            "labels": labels,
+            "scores": scores,
+        }
+
         if self.flags["predict_gen_pmfs"]:
             # Generate PMFs for each animal
             pmfs = self.make_pmf(batch)
-            return labels, scores, pmfs
+            output["pmfs"] = pmfs
 
-        return labels, scores
+        if self.flags["predict_return_embeddings"]:
+            # unexpand audio embeddings to remove redundant data
+            output["audio_embeddings"] = audio_embeddings[:, 0, :]
+
+        return output
 
     def make_pmf(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         """Computes score distributions for each candidate source location for each
@@ -393,7 +575,9 @@ class LVocalocator(L.LightningModule):
                 indexing="ij",
             ),  # returns tuple x,y with coords (x,y)
             axis=-1,
-        ).transpose(1, 0, 2)  # (n_y, n_x, 3)
+        ).transpose(
+            1, 0, 2
+        )  # (n_y, n_x, 3)
         head_location = torch.from_numpy(head_location).float().to(labels.device)
 
         # Get the nose location grid from the head locations and the animal directions
@@ -532,7 +716,9 @@ class LVocalocator(L.LightningModule):
                 indexing="ij",
             ),  # returns tuple x,y,z with coords (x,y,z)
             axis=-1,
-        ).transpose(2, 1, 0, 3)  # (n_z, n_y, n_x, 3)
+        ).transpose(
+            2, 1, 0, 3
+        )  # (n_z, n_y, n_x, 3)
         head_location = torch.from_numpy(head_location).float().to(labels.device)
 
         # Combine get the nose location from the head location and the animal direction
@@ -627,3 +813,43 @@ class LVocalocator(L.LightningModule):
                 "monitor": "total_training_loss",
             },
         }
+
+
+if __name__ == "__main__":
+    print("Testing animal id")
+    # Test animal id functionality
+    num_animals = 2
+    d_embedding = 128
+    batch_size = 15
+    num_negatives = 19
+
+    fake_loc_embeddings = torch.randn(
+        (batch_size, num_negatives + 1, num_animals, d_embedding)
+    )
+    animal_id_embedding = AnimalIdentityEmbedding(
+        num_animals=num_animals, d_embedding=d_embedding
+    )
+    # Will allow us to see if it's being applied correctly
+    animal_id_embedding.animal_identity_embedding.data[0, :] = float("nan")
+    animal_id_embedding.animal_identity_embedding.data[1, :] = float("inf")
+
+    animal_ids = torch.tensor([0, 1]).repeat(batch_size, num_negatives + 1, 1)
+    print(
+        "Before running forward: ", animal_id_embedding.animal_id_lookup.active_buffer
+    )
+    animal_id_embedding(fake_loc_embeddings, animal_ids)  # Seed the buffer
+    print("After running forward: ", animal_id_embedding.animal_id_lookup.active_buffer)
+
+    import tempfile
+
+    # Test saving and reloading the embedding
+    with tempfile.TemporaryDirectory() as tmpdir:
+        print("testing save and load of animal id embedding")
+        torch.save(animal_id_embedding.state_dict(), f"{tmpdir}/embedding.pt")
+        new_embedding = AnimalIdentityEmbedding(num_animals=2, d_embedding=d_embedding)
+        new_embedding.load_state_dict(torch.load(f"{tmpdir}/embedding.pt"))
+        print("After load: ", new_embedding.animal_id_lookup.active_buffer)
+        new_embedding(fake_loc_embeddings, animal_ids)
+        print("After eval: ", new_embedding.animal_id_lookup.active_buffer)
+        assert torch.isnan(new_embedding.animal_identity_embedding.data[0, :]).all()
+        assert torch.isinf(new_embedding.animal_identity_embedding.data[1, :]).all()

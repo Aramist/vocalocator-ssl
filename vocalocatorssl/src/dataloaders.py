@@ -51,13 +51,19 @@ def collate(batch) -> dict[str, torch.Tensor]:
     """Collate function for the dataloader. Takes a list of (audio, label) tuples and returns
     a batch of audio and labels.
     """
-    audio, labels = [x[0] for x in batch], [x[1] for x in batch]
+    audio, labels, animal_ids = (
+        [x[0] for x in batch],
+        [x[1] for x in batch],
+        [x[2] for x in batch],
+    )
     audio = torch.stack(audio)
     labels = torch.stack(labels)
+    animal_ids = torch.stack(animal_ids) if animal_ids[0] is not None else None
 
     # Audio should end up with shape (batch, channels, time)
     # Labels should end up with shape (batch, 1 + num_false, n_animals, n_nodes, n_dims)
-    return {"audio": audio, "labels": labels}
+    # Animal ids should end up with shape (batch, 1 + num_false, n_animals) if they are available
+    return {"audio": audio, "labels": labels, "animal_ids": animal_ids}
 
 
 class DifficultySampler(torch.utils.data.Sampler):
@@ -262,6 +268,7 @@ class SingleVocalizationDataset(Dataset):
         self.inverse_index = {v: k for k, v in enumerate(self.index)}
         self.rng: np.random.Generator
         self.num_animals: int = dataset["locations"].shape[1]
+        self.has_animal_ids: bool = "track_id" in dataset or "animal_id" in dataset
 
         # Determine which nodes indices to select
         if nodes is None:
@@ -436,7 +443,7 @@ class SingleVocalizationDataset(Dataset):
 
     def sample_negative_location(
         self, idx: int, difficulty: Optional[float], *, n: int = 1
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Samples a negative frame from the dataset for index `idx` based on the
         current difficulty level. This is done by computing a distribution over
         the dataset based on each frame's difficulty and sampling from it to obtain
@@ -451,12 +458,23 @@ class SingleVocalizationDataset(Dataset):
             torch.Tensor: Animal poses for the negative frame. Shape: (n_requested, n_animals, n_nodes, n_dims)
         """
         if n == 0:
-            n_animals, n_nodes, n_dims = self.__label_for_index(idx).shape
-            return torch.empty((0, n_animals, n_nodes, n_dims))
+            n_animals, n_nodes, n_dims = self.__label_for_index(idx)[0].shape
+            return torch.empty((0, n_animals, n_nodes, n_dims)), torch.empty(
+                (0, n_animals), dtype=torch.long
+            )
         if difficulty is None:
             choices = np.delete(self.index, self.inverse_index[idx])
             neg_idx = self.rng.choice(choices, size=n, replace=True)
-            return torch.stack([self.__label_for_index(i) for i in neg_idx], dim=0)
+            negs = [self.__label_for_index(i) for i in neg_idx]
+            neg_locs = torch.stack([neg[0] for neg in negs], dim=0)
+            neg_ids = (
+                torch.stack([neg[1] for neg in negs], dim=0)
+                if self.has_animal_ids
+                else None
+            )
+            return neg_locs, neg_ids
+
+        raise NotImplementedError("Difficulty sampling not implemented yet")
 
         search_radius = self.pairwise_distance_quantiles[
             int(difficulty * (len(self.pairwise_distance_quantiles) - 1))
@@ -491,7 +509,7 @@ class SingleVocalizationDataset(Dataset):
         audio = self.dataset["audio"][start:end, ...]
         return torch.from_numpy(audio)
 
-    def __label_for_index(self, idx: int) -> torch.Tensor:
+    def __label_for_index(self, idx: int) -> tuple[torch.Tensor, None | torch.Tensor]:
         """Gets the ground truth source location for the vocalization at the given index
 
         Args:
@@ -512,28 +530,38 @@ class SingleVocalizationDataset(Dataset):
             # allow evaluating or training on single animal datasets
             locs = locs[None, ...]
 
+        animal_id = None
+        if "track_id" in self.dataset:
+            animal_id = torch.from_numpy(
+                self.dataset["track_id"][idx].astype(np.int64)
+            )  # (num_animals,)
+        elif "animal_id" in self.dataset:
+            animal_id = torch.from_numpy(
+                self.dataset["animal_id"][idx].astype(np.int64)
+            )  # (num_animals,)
+
         locs = torch.from_numpy(locs.astype(np.float32))
-        return locs
+        return locs, animal_id
 
-    def __labels_for_indices(self, indices: np.ndarray) -> torch.Tensor:
-        """Gets the ground truth source location for the vocalization at the given indices
+    # def __labels_for_indices(self, indices: np.ndarray) -> torch.Tensor:
+    #     """Gets the ground truth source location for the vocalization at the given indices
 
-        Args:
-            indices (np.ndarray): Indices of the vocalizations
+    #     Args:
+    #         indices (np.ndarray): Indices of the vocalizations
 
-        Returns:
-            torch.Tensor: The source location of the vocalizations, if available. Shape: (n_animals, n_node, n_dim). Unit: dataset unit
-        """
-        if self.location_cache is None:
-            return torch.stack([self.__label_for_index(i) for i in indices], dim=0)
-        locs = self.location_cache[indices][..., self.node_indices, :]
-        # either (n_animals, n_nodes, n_dims) if len(locs.shape) == 3
-        # or (n_nodes, n_dims)
-        if len(locs.shape) == 3:
-            # allow evaluating or training on single animal datasets
-            locs = locs[:, None, ...]
-        locs = torch.from_numpy(locs.astype(np.float32))
-        return locs
+    #     Returns:
+    #         torch.Tensor: The source location of the vocalizations, if available. Shape: (n_animals, n_node, n_dim). Unit: dataset unit
+    #     """
+    #     if self.location_cache is None:
+    #         return torch.stack([self.__label_for_index(i) for i in indices], dim=0)
+    #     locs = self.location_cache[indices][..., self.node_indices, :]
+    #     # either (n_animals, n_nodes, n_dims) if len(locs.shape) == 3
+    #     # or (n_nodes, n_dims)
+    #     if len(locs.shape) == 3:
+    #         # allow evaluating or training on single animal datasets
+    #         locs = locs[:, None, ...]
+    #     locs = torch.from_numpy(locs.astype(np.float32))
+    #     return locs
 
     def scale_audio(
         self,
@@ -561,7 +589,7 @@ class SingleVocalizationDataset(Dataset):
 
     def __processed_data_for_index__(
         self, idx: int, difficulty: Optional[float]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, tuple[torch.Tensor, None | torch.Tensor]]:
         """Gets the audio and locations from a given index in the dataset. This function
         should not be called directly.
 
@@ -570,23 +598,26 @@ class SingleVocalizationDataset(Dataset):
             difficulty (Optional[float]): Difficulty level of the current index. Should be between 0 and 1 (0 is most difficult).
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: The audio and locations (+ and -) for
+            Tuple[torch.Tensor, torch.Tensor, None | torch.Tensor]: The audio, animal ids, and locations (+ and -) for
         the index. Audio is of shape (n_samples, n_channels).
         Locations are of shape (n_negative + 1, n_animals, n_nodes, n_dims)
         """
 
         sound = self.__audio_for_index(idx)
         sound = self.__make_crop(sound, self.crop_length)
-        positive_location = self.__label_for_index(idx)
-        negative_locations = self.sample_negative_location(
+        positive_location, positive_ids = self.__label_for_index(idx)
+        negative_locations, negative_ids = self.sample_negative_location(
             idx, difficulty, n=self.num_negative_samples
         )
         locations = torch.cat(
             [positive_location.unsqueeze(0), negative_locations], dim=0
         )
         sound, locations = self.scale_audio(sound), self.scale_labels(locations)
+        all_ids = None
+        if positive_ids is not None and negative_ids is not None:
+            all_ids = torch.cat([positive_ids.unsqueeze(0), negative_ids], dim=0)
 
-        return sound, locations
+        return sound, locations, all_ids
 
 
 class PluralVocalizationDataset(Dataset):
@@ -612,7 +643,7 @@ class PluralVocalizationDataset(Dataset):
 
     def __getitem__(
         self, args: tuple[int, int, float | None]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, None | torch.Tensor]]:
         """Gets the audio and locations from a given index in the given dataset.
 
         Args:
@@ -621,7 +652,7 @@ class PluralVocalizationDataset(Dataset):
                 The difficulty level is used to sample negative locations.
 
         Returns:
-            tuple[torch.Tensor, torch.Tensor]: Audio and locations
+            tuple[torch.Tensor, torch.Tensor, None | torch.Tensor]: Audio and locations
         """
         return self.datasets[args[0]][args[1:]]
 

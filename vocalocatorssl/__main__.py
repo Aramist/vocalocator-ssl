@@ -49,7 +49,7 @@ def make_trainer(config: dict, save_directory: Path, **kwargs) -> L.Trainer:
                 verbose=False,
             ),
             # End training if validation accuracy does not improve
-            callbacks.EarlyStopping(monitor="val_acc", mode="max", patience=100),
+            callbacks.EarlyStopping(monitor="val_acc", mode="max", patience=10),
             # End training if weights explode
             callbacks.EarlyStopping(
                 monitor="total_training_loss",
@@ -81,10 +81,13 @@ def train_default(
 
     default_cfg = utilsmodule.get_default_config()
     config = utilsmodule.update_recursively(config, default_cfg)
+    wandb_logger = WandbLogger(
+        name=save_directory.name, project="vocalocator-ssl", save_dir=save_directory
+    )
     trainer = make_trainer(
         config,
         save_directory,
-        logger=WandbLogger(project="vocalocatorssl", save_dir=save_directory),
+        logger=wandb_logger,
     )
 
     train_dloader, val_dloader, test_dloader = utilsmodule.initialize_dataloaders(
@@ -114,6 +117,13 @@ def train_default(
         )
     else:
         model = LVocalocator(config)
+
+    param_count = 0
+    for param in model.parameters():
+        if param.requires_grad:
+            param_count += param.numel()
+    print(f"Number of trainable parameters: {param_count}")
+    wandb_logger.experiment.summary["num_trainable_params"] = param_count
 
     trainer.fit(model, train_dloader, val_dloader)
 

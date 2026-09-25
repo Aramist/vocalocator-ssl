@@ -1,1 +1,1 @@
-#DISBATCH REPEAT 20 /mnt/home/atanelus/run_mouse_sweep_wandb.sh
+#DISBATCH REPEAT 20 ( /mnt/home/atanelus/vocalocator-ssl/run_mouse_sweep_wandb.sh ) &> logs/${DISBATCH_REPEAT_INDEX}.log
